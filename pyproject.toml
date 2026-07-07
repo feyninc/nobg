@@ -1,0 +1,18 @@
+[project]
+name = "nobg"
+version = "0.2.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "torch>=2.0",
+    "huggingface_hub>=1.22.0",
+    "transformers>=5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nobg"]
