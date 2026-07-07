@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from transformers import GPT2Config as _TransformersGPT2Config
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
-from .mixin import Revised_Mixin
-from .utils import model_card_template
+from ..mixin import Revised_Mixin
+from ..utils import model_card_template
 
 
 @dataclass

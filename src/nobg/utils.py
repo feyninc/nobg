@@ -1,4 +1,6 @@
 from functools import wraps
+
+
 # update docs for specific functions
 def set_doc(doc):
     def decorator(func):
@@ -10,7 +12,6 @@ def set_doc(doc):
         return wrapper
 
     return decorator
-
 
 
 # general template for models

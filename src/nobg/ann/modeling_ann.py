@@ -2,8 +2,8 @@ from torch import nn
 from dataclasses import dataclass
 from typing import Optional
 
-from .mixin import Revised_Mixin
-from .utils import model_card_template
+from ..mixin import Revised_Mixin
+from ..utils import model_card_template
 
 
 @dataclass
