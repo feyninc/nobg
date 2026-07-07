@@ -1,38 +1,15 @@
 from torch import nn
+from dataclasses import dataclass
+from typing import Optional
+
 from .mixin import Revised_Mixin
+from .utils import model_card_template
 
-model_card_template = """
----
-{{ card_data }}
----
 
-This model has been pushed to the Hub using the [PytorchModelHubMixin](https://huggingface.co/docs/huggingface_hub/package_reference/mixins#huggingface_hub.PyTorchModelHubMixin) integration.
-
-Library: [nobg]({{repo_url}})
-
-## how to load
-```
-pip install nobg
-```
-
-use the AutoModel class
-```python
-from nobg AutoModel
-model = AutoModel.from_pretrained("{{ repo_id | default("nobg/ann", true) }}")
-```
-or you can use the model class directly
-```python
-from nobg import ANN
-model = ANN.from_pretrained("{{ repo_id | default("nobg/ann", true ) }}")
-```
-
-## Contributions
-Any contributions are welcome at https://github.com/feyninc/nobg.
-
-<img src="https://usefeyn.com/feyn/feyn_mark.svg"/>
-
-"""
-default_conf = {"a": 2, "b": 1}
+@dataclass
+class ANNConfig:
+    a: int = 2
+    b: int = 1
 
 
 class ANN(
@@ -41,14 +18,14 @@ class ANN(
     library_name="nobg",
     repo_url="https://github.com/feyninc/nobg",
     tags=["nobg", "ann"],
-    model_card_template=model_card_template,
+    model_card_template=model_card_template(class_name="ANN", default_repo="nobg/ann"),
 ):
     """an AI model for visual question answering"""
 
-    def __init__(self, cfg: dict = default_conf):
+    def __init__(self, config: Optional[ANNConfig] = None):
         super().__init__()
-        self.cfg = cfg
-        self.layer = nn.Linear(cfg["a"], cfg["b"], bias=False)
+        self.config = config or ANNConfig()
+        self.layer = nn.Linear(self.config.a, self.config.b, bias=False)
 
     def forward(self, input_ids):
         return self.layer(input_ids)

@@ -1,4 +1,5 @@
 from huggingface_hub import PyTorchModelHubMixin, whoami
+from .utils import set_doc
 
 from typing import (
     TYPE_CHECKING,
@@ -14,13 +15,14 @@ if TYPE_CHECKING:
 
 
 class Revised_Mixin(PyTorchModelHubMixin):
+    @set_doc(PyTorchModelHubMixin.push_to_hub.__doc__)
     def push_to_hub(
         self,
         repo_id: str,
         *,
         config: Optional[Union[dict, "DataclassInstance"]] = None,
         commit_message: str = "Push model using huggingface_hub.",
-        private: bool = False,
+        private: Optional[bool] = None,
         token: Optional[str] = None,
         branch: Optional[str] = None,
         create_pr: Optional[bool] = None,
@@ -48,6 +50,3 @@ class Revised_Mixin(PyTorchModelHubMixin):
             delete_patterns=delete_patterns,
             model_card_kwargs=model_card_kwargs,
         )
-
-
-Revised_Mixin.push_to_hub.__doc__ = PyTorchModelHubMixin.push_to_hub.__doc__
