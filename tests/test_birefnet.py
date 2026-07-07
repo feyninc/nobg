@@ -30,10 +30,10 @@ class TestBiRefNet:
 
     def test_init_default_config(self):
         model = BiRefNet()
-        assert model.config.embed_dim == 96
+        assert model.config.embed_dim == 192
         assert model.config.image_size == 1024
-        assert model.config.depths == [2, 2, 6, 2]
-        assert model.config.num_heads == [3, 6, 12, 24]
+        assert model.config.depths == [2, 2, 18, 2]
+        assert model.config.num_heads == [6, 12, 24, 48]
 
     def test_init_custom_config(self, small_model):
         assert small_model.config.embed_dim == 16

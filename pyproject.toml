@@ -23,6 +23,7 @@ dependencies = [
     "torch>=2.0",
     "huggingface_hub>=1.22.0",
     "transformers>=5.0",
+    "torchvision>=0.27.1",
 ]
 
 [dependency-groups]
