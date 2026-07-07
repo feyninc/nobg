@@ -1,12 +1,12 @@
 [project]
 name = "nobg"
 version = "0.1.0"
-description = "A library for image and video matting with HuggingFace Hub integration"
+description = "Open source background removal models for image and video matting"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
 authors = [
-    { name = "feyninc" },
+    { name = "Hafedh Hichri", email = "lain@chonkie.ai" },
 ]
 keywords = ["matting", "background-removal", "deep-learning", "pytorch", "huggingface"]
 classifiers = [
