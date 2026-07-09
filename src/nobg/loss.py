@@ -27,7 +27,9 @@ def birefnet_loss(scaled_preds: list[torch.Tensor], gt: torch.Tensor) -> torch.T
     loss = torch.tensor(0.0, device=gt.device)
     for pred in scaled_preds:
         if pred.shape[2:] != gt.shape[2:]:
-            pred = F.interpolate(pred, size=gt.shape[2:], mode="bilinear", align_corners=True)
+            pred = F.interpolate(
+                pred, size=gt.shape[2:], mode="bilinear", align_corners=True
+            )
         pred_sig = pred.sigmoid()
         loss = loss + 30 * F.binary_cross_entropy_with_logits(pred, gt)
         loss = loss + 0.5 * iou_loss(pred_sig, gt)
