@@ -1,6 +1,6 @@
 [project]
 name = "nobg"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Open source background removal models for image and video matting"
 readme = "README.md"
 license = "MIT"
@@ -48,6 +48,9 @@ Issues = "https://github.com/feyninc/nobg/issues"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/nobg/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nobg"]
