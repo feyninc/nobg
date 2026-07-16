@@ -23,10 +23,8 @@ model = AutoModel.from_pretrained("nobg/BiRefNet")
 ### Load a specific model
 
 ```python
-from nobg import ANN, GPT2, BiRefNet
+from nobg import BiRefNet
 
-model = ANN.from_pretrained("nobg/ann")
-model = GPT2.from_pretrained("nobg/gpt2")
 model = BiRefNet.from_pretrained("nobg/BiRefNet")
 ```
 

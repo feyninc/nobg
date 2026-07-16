@@ -39,6 +39,10 @@ notebooks = [
     "ipykernel>=6.0",
     "matplotlib>=3.0",
 ]
+train = [
+    "python-dotenv>=1.0",
+    "wandb>=0.17",
+]
 
 [project.urls]
 Homepage = "https://github.com/feyninc/nobg"

@@ -15,7 +15,20 @@ def set_doc(doc):
 
 
 # general template for models
-def model_card_template(*, class_name: str, default_repo: str) -> str:
+def model_card_template(
+    *, class_name: str, default_repo: str, citation: str | None = None
+) -> str:
+    citation_section = (
+        f"""
+## Citation
+If you use this model, please cite:
+```bibtex
+{citation}
+```
+"""
+        if citation
+        else ""
+    )
     return f"""---
 {{{{ card_data }}}}
 ---
@@ -44,6 +57,7 @@ from nobg import {class_name}
 model = {class_name}.from_pretrained("{{{{ repo_id | default("{default_repo}", true) }}}}")
 ```
 
+{citation_section}
 ## Contributions
 Any contributions are welcome at https://github.com/feyninc/nobg
 

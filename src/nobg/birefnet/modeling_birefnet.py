@@ -1,24 +1,41 @@
-import numpy as np
+import logging
+import os
+import re
+from dataclasses import dataclass, field, fields
+from typing import Optional, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass, field
-from typing import Optional, Union
-
 from torchvision.ops import deform_conv2d
+from transformers import SwinConfig
+from transformers.models.swin.modeling_swin import SwinBackbone
 
 from ..loss import birefnet_loss
 from ..mixin import Revised_Mixin
 from ..utils import model_card_template
 
+logger = logging.getLogger(__name__)
+
+NOBG_VERSION = "0.2.0"
+
+NOBG_CITATION = """@software{nobg,
+  title={nobg: Open Source Background Removal Models for Image and Video Matting},
+  author={Hichri, Hafedh},
+  year={2026},
+  url={https://github.com/feyninc/nobg},
+  license={MIT},
+}"""
+
 
 @dataclass
 class BiRefNetConfig:
-    """Configuration for BiRefNet (Bilateral Reference Network) with Swin-L backbone."""
+    """Configuration for BiRefNet (Bilateral Reference Network) with Swin backbone."""
 
     image_size: int = 1024
     patch_size: int = 4
     embed_dim: int = 192
+    num_layers: int = 4
     depths: list = field(default_factory=lambda: [2, 2, 18, 2])
     num_heads: list = field(default_factory=lambda: [6, 12, 24, 48])
     window_size: int = 12
@@ -28,369 +45,17 @@ class BiRefNetConfig:
     use_multi_scale_input: bool = True
     use_gradient_attention: bool = True
     use_image_patch_injection: bool = True
+    nobg_version: str = NOBG_VERSION
 
-
-def window_partition(x, window_size):
-    B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = (
-        x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    )
-    return windows
-
-
-def window_reverse(windows, window_size, H, W):
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.view(
-        B, H // window_size, W // window_size, window_size, window_size, -1
-    )
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-    return x
-
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.0):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.drop(self.act(self.fc1(x)))
-        x = self.drop(self.fc2(x))
-        return x
-
-
-class WindowAttention(nn.Module):
-    relative_position_index: torch.Tensor
-
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True):
-        super().__init__()
-        self.dim = dim
-        self.window_size = (window_size, window_size)
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
-
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)
-        )
-        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
-
-        coords_h = torch.arange(self.window_size[0])
-        coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing="ij"))
-        coords_flatten = torch.flatten(coords, 1)
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
-        relative_coords[:, :, 0] += self.window_size[0] - 1
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-        relative_position_index = relative_coords.sum(-1)
-        self.register_buffer("relative_position_index", relative_position_index)
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x, mask=None):
-        B_, N, C = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        )
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(
-            self.window_size[0] * self.window_size[1],
-            self.window_size[0] * self.window_size[1],
-            -1,
-        )
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attn = attn + relative_position_bias.unsqueeze(0)
-
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(
-                1
-            ).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-
-        attn = self.softmax(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        return x
-
-
-class DropPath(nn.Module):
-    def __init__(self, drop_prob=0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x):
-        if self.drop_prob == 0.0 or not self.training:
-            return x
-        keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor = torch.floor(random_tensor + keep_prob)
-        return x / keep_prob * random_tensor
-
-
-class SwinTransformerBlock(nn.Module):
-    def __init__(
-        self, dim, num_heads, window_size=7, shift_size=0, mlp_ratio=4.0, drop_path=0.0
-    ):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
-
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = WindowAttention(dim, window_size=window_size, num_heads=num_heads)
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio))
-
-    def forward(self, x, H, W, mask_matrix):
-        B, L, C = x.shape
-        assert L == H * W
-
-        shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
-
-        pad_l = pad_t = 0
-        pad_r = (self.window_size - W % self.window_size) % self.window_size
-        pad_b = (self.window_size - H % self.window_size) % self.window_size
-        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
-        _, Hp, Wp, _ = x.shape
-
-        if self.shift_size > 0:
-            shifted_x = torch.roll(
-                x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2)
+    def __post_init__(self):
+        if len(self.depths) != self.num_layers:
+            raise ValueError(
+                f"depths has {len(self.depths)} entries but num_layers={self.num_layers}"
             )
-            attn_mask = mask_matrix
-        else:
-            shifted_x = x
-            attn_mask = None
-
-        x_windows = window_partition(shifted_x, self.window_size)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
-
-        attn_windows = self.attn(x_windows, mask=attn_mask)
-
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)
-
-        if self.shift_size > 0:
-            x = torch.roll(
-                shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2)
+        if len(self.num_heads) != self.num_layers:
+            raise ValueError(
+                f"num_heads has {len(self.num_heads)} entries but num_layers={self.num_layers}"
             )
-        else:
-            x = shifted_x
-
-        if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
-
-        x = x.view(B, H * W, C)
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
-
-
-class PatchMerging(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm = nn.LayerNorm(4 * dim)
-
-    def forward(self, x, H, W):
-        B, L, C = x.shape
-        assert L == H * W
-
-        x = x.view(B, H, W, C)
-        pad_h = (2 - H % 2) % 2
-        pad_w = (2 - W % 2) % 2
-        if pad_h or pad_w:
-            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
-
-        x0 = x[:, 0::2, 0::2, :]
-        x1 = x[:, 1::2, 0::2, :]
-        x2 = x[:, 0::2, 1::2, :]
-        x3 = x[:, 1::2, 1::2, :]
-        x = torch.cat([x0, x1, x2, x3], -1)
-        x = x.view(B, -1, 4 * C)
-        x = self.norm(x)
-        x = self.reduction(x)
-        return x
-
-
-class BasicLayer(nn.Module):
-    def __init__(
-        self,
-        dim,
-        depth,
-        num_heads,
-        window_size=7,
-        mlp_ratio=4.0,
-        drop_path=None,
-        downsample=None,
-    ):
-        super().__init__()
-        self.window_size = window_size
-        self.shift_size = window_size // 2
-        self.depth = depth
-
-        self.blocks = nn.ModuleList(
-            [
-                SwinTransformerBlock(
-                    dim=dim,
-                    num_heads=num_heads,
-                    window_size=window_size,
-                    shift_size=0 if (i % 2 == 0) else window_size // 2,
-                    mlp_ratio=mlp_ratio,
-                    drop_path=drop_path[i] if drop_path is not None else 0.0,
-                )
-                for i in range(depth)
-            ]
-        )
-
-        self.downsample = PatchMerging(dim) if downsample else None
-
-    def forward(self, x, H, W):
-        attn_mask = self._compute_mask(H, W, x.device)
-        for blk in self.blocks:
-            x = blk(x, H, W, attn_mask)
-        x_out = x
-
-        if self.downsample is not None:
-            x_down = self.downsample(x, H, W)
-            Wh, Ww = (H + 1) // 2, (W + 1) // 2
-            return x_out, H, W, x_down, Wh, Ww
-        else:
-            return x_out, H, W, x, H, W
-
-    def _compute_mask(self, H, W, device):
-        if self.shift_size == 0:
-            return None
-        Hp = int(np.ceil(H / self.window_size)) * self.window_size
-        Wp = int(np.ceil(W / self.window_size)) * self.window_size
-        img_mask = torch.zeros((1, Hp, Wp, 1), device=device)
-        h_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
-        )
-        w_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
-        )
-        cnt = 0
-        for h in h_slices:
-            for w in w_slices:
-                img_mask[:, h, w, :] = cnt
-                cnt += 1
-        mask_windows = window_partition(img_mask, self.window_size)
-        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
-            attn_mask == 0, float(0.0)
-        )
-        return attn_mask
-
-
-class PatchEmbed(nn.Module):
-    def __init__(self, patch_size=4, in_channels=3, embed_dim=96):
-        super().__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Conv2d(
-            in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
-        )
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x):
-        x = self.proj(x)
-        Wh, Ww = x.size(2), x.size(3)
-        x = x.flatten(2).transpose(1, 2)
-        x = self.norm(x)
-        x = x.transpose(1, 2).view(-1, x.shape[2], Wh, Ww)
-        return x, Wh, Ww
-
-
-class SwinBackbone(nn.Module):
-    def __init__(self, config: BiRefNetConfig):
-        super().__init__()
-        embed_dim = config.embed_dim
-        depths = config.depths
-        num_heads = config.num_heads
-        window_size = config.window_size
-        mlp_ratio = config.mlp_ratio
-        drop_path_rate = config.drop_path_rate
-
-        self.num_layers = len(depths)
-        self.embed_dim = embed_dim
-        self.num_features = [int(embed_dim * 2**i) for i in range(self.num_layers)]
-        self.out_indices = (0, 1, 2, 3)
-
-        self.patch_embed = PatchEmbed(
-            patch_size=config.patch_size, in_channels=3, embed_dim=embed_dim
-        )
-        self.pos_drop = nn.Dropout(p=0.0)
-
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-
-        self.layers = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            layer = BasicLayer(
-                dim=int(embed_dim * 2**i_layer),
-                depth=depths[i_layer],
-                num_heads=num_heads[i_layer],
-                window_size=window_size,
-                mlp_ratio=mlp_ratio,
-                drop_path=dpr[sum(depths[:i_layer]) : sum(depths[: i_layer + 1])],
-                downsample=True if (i_layer < self.num_layers - 1) else False,
-            )
-            self.layers.append(layer)
-
-        for i_layer in self.out_indices:
-            layer = nn.LayerNorm(self.num_features[i_layer])
-            layer_name = f"norm{i_layer}"
-            self.add_module(layer_name, layer)
-
-    def forward(self, x):
-        x, Wh, Ww = self.patch_embed(x)
-        x = x.flatten(2).transpose(1, 2)
-        x = self.pos_drop(x)
-
-        outs = []
-        for i in range(self.num_layers):
-            layer = self.layers[i]
-            x_out, H, W, x, Wh, Ww = layer(x, Wh, Ww)
-
-            if i in self.out_indices:
-                norm_layer = getattr(self, f"norm{i}")
-                x_out = norm_layer(x_out)
-                out = (
-                    x_out.view(-1, H, W, self.num_features[i])
-                    .permute(0, 3, 1, 2)
-                    .contiguous()
-                )
-                outs.append(out)
-
-        return tuple(outs)
 
 
 class DeformableConv2d(nn.Module):
@@ -570,222 +235,184 @@ def image2patches(image, patch_ref):
 
 
 class Decoder(nn.Module):
+    """Generic BiRefNet decoder over `num_layers` stages.
+
+    `channels` is deep-to-shallow: channels[0] is the (squeezed) deepest
+    feature width, channels[-1] the shallowest. Stage i of the loop consumes
+    channels[i] (+ optional image-patch injection) and produces channels[i+1],
+    except the last stage which produces channels[-1] // 2.
+    """
+
     def __init__(self, channels: list[int], config: BiRefNetConfig):
         super().__init__()
         inter = config.dec_channels_inter
-
-        ipt_cha = channels[0] // 8
-
-        if config.use_image_patch_injection:
-            # Input channels use image2patches: 3 * (image_size / ref_size)^2
-            # For default 1024: x4=32x32->3*32*32=3072, x3=64->768, x2=128->192, x1=256->48, full=3
-            ipt5_in = (
-                3
-                * (
-                    config.image_size
-                    // (config.image_size // config.patch_size // 2**3)
-                )
-                ** 2
-            )
-            ipt4_in = (
-                3
-                * (
-                    config.image_size
-                    // (config.image_size // config.patch_size // 2**2)
-                )
-                ** 2
-            )
-            ipt3_in = (
-                3
-                * (
-                    config.image_size
-                    // (config.image_size // config.patch_size // 2**1)
-                )
-                ** 2
-            )
-            ipt2_in = (
-                3 * (config.image_size // (config.image_size // config.patch_size)) ** 2
-            )
-            ipt1_in = 3
-            self.ipt_blk5 = SimpleConvs(ipt5_in, ipt_cha, inter_channels=inter)
-            self.ipt_blk4 = SimpleConvs(ipt4_in, ipt_cha, inter_channels=inter)
-            self.ipt_blk3 = SimpleConvs(ipt3_in, channels[1] // 8, inter_channels=inter)
-            self.ipt_blk2 = SimpleConvs(ipt2_in, channels[2] // 8, inter_channels=inter)
-            self.ipt_blk1 = SimpleConvs(ipt1_in, channels[3] // 8, inter_channels=inter)
-
-        self.decoder_block4 = BasicDecBlk(channels[0] + ipt_cha, channels[1], inter)
-        self.decoder_block3 = BasicDecBlk(channels[1] + ipt_cha, channels[2], inter)
-        self.decoder_block2 = BasicDecBlk(
-            channels[2] + channels[1] // 8, channels[3], inter
-        )
-        self.decoder_block1 = BasicDecBlk(
-            channels[3] + channels[2] // 8, channels[3] // 2, inter
-        )
-
-        self.conv_out1 = nn.Sequential(
-            nn.Conv2d(channels[3] // 2 + channels[3] // 8, 1, 1, 1, 0)
-        )
-
-        self.lateral_block4 = BasicLatBlk(channels[1], channels[1])
-        self.lateral_block3 = BasicLatBlk(channels[2], channels[2])
-        self.lateral_block2 = BasicLatBlk(channels[3], channels[3])
-
-        self.conv_ms_spvn_4 = nn.Conv2d(channels[1], 1, 1, 1, 0)
-        self.conv_ms_spvn_3 = nn.Conv2d(channels[2], 1, 1, 1, 0)
-        self.conv_ms_spvn_2 = nn.Conv2d(channels[3], 1, 1, 1, 0)
-
-        if config.use_gradient_attention:
-            _N = 16
-            self.gdt_convs_4 = nn.Sequential(
-                nn.Conv2d(channels[1], _N, 3, 1, 1),
-                nn.BatchNorm2d(_N),
-                nn.ReLU(inplace=True),
-            )
-            self.gdt_convs_3 = nn.Sequential(
-                nn.Conv2d(channels[2], _N, 3, 1, 1),
-                nn.BatchNorm2d(_N),
-                nn.ReLU(inplace=True),
-            )
-            self.gdt_convs_2 = nn.Sequential(
-                nn.Conv2d(channels[3], _N, 3, 1, 1),
-                nn.BatchNorm2d(_N),
-                nn.ReLU(inplace=True),
-            )
-            self.gdt_convs_pred_4 = nn.Sequential(nn.Conv2d(_N, 1, 1, 1, 0))
-            self.gdt_convs_pred_3 = nn.Sequential(nn.Conv2d(_N, 1, 1, 1, 0))
-            self.gdt_convs_pred_2 = nn.Sequential(nn.Conv2d(_N, 1, 1, 1, 0))
-            self.gdt_convs_attn_4 = nn.Sequential(nn.Conv2d(_N, 1, 1, 1, 0))
-            self.gdt_convs_attn_3 = nn.Sequential(nn.Conv2d(_N, 1, 1, 1, 0))
-            self.gdt_convs_attn_2 = nn.Sequential(nn.Conv2d(_N, 1, 1, 1, 0))
-
+        n = config.num_layers
+        self.num_layers = n
         self.use_gradient_attention = config.use_gradient_attention
         self.use_image_patch_injection = config.use_image_patch_injection
 
+        # Injection output widths: stages 0 and 1 use channels[0] // 8; stage
+        # j >= 2 uses channels[j - 1] // 8; the final full-resolution injection
+        # uses channels[-1] // 8.
+        ipt_out = [channels[0] // 8] + [
+            channels[max(j - 1, 0)] // 8 for j in range(1, n)
+        ]
+        ipt_out.append(channels[-1] // 8)
+
+        if config.use_image_patch_injection:
+            # image2patches gives 3 * grid^2 channels; the grid at stage j is
+            # patch_size * 2**(n - 1 - j), and 1 at full resolution.
+            ipt_in = [
+                3 * (config.patch_size * 2 ** (n - 1 - j)) ** 2 for j in range(n)
+            ] + [3]
+            self.ipt_blks = nn.ModuleList(
+                [
+                    SimpleConvs(ipt_in[j], ipt_out[j], inter_channels=inter)
+                    for j in range(n + 1)
+                ]
+            )
+
+        dec_in = [channels[i] + ipt_out[i] for i in range(n)]
+        dec_out = [channels[i + 1] for i in range(n - 1)] + [channels[-1] // 2]
+        self.decoder_blocks = nn.ModuleList(
+            [BasicDecBlk(dec_in[i], dec_out[i], inter) for i in range(n)]
+        )
+
+        self.lateral_blocks = nn.ModuleList(
+            [BasicLatBlk(channels[i + 1], channels[i + 1]) for i in range(n - 1)]
+        )
+
+        self.conv_ms_spvn = nn.ModuleList(
+            [nn.Conv2d(channels[i + 1], 1, 1, 1, 0) for i in range(n - 1)]
+        )
+
+        if config.use_gradient_attention:
+            _N = 16
+            self.gdt_convs = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Conv2d(channels[i + 1], _N, 3, 1, 1),
+                        nn.BatchNorm2d(_N),
+                        nn.ReLU(inplace=True),
+                    )
+                    for i in range(n - 1)
+                ]
+            )
+            self.gdt_convs_pred = nn.ModuleList(
+                [nn.Sequential(nn.Conv2d(_N, 1, 1, 1, 0)) for _ in range(n - 1)]
+            )
+            self.gdt_convs_attn = nn.ModuleList(
+                [nn.Sequential(nn.Conv2d(_N, 1, 1, 1, 0)) for _ in range(n - 1)]
+            )
+
+        self.conv_out1 = nn.Sequential(
+            nn.Conv2d(channels[-1] // 2 + channels[-1] // 8, 1, 1, 1, 0)
+        )
+
+    def _inject(self, image, p, blk, size):
+        patches = image2patches(image, patch_ref=p)
+        patches = F.interpolate(patches, size=size, mode="bilinear", align_corners=True)
+        return torch.cat((p, blk(patches)), 1)
+
     def forward(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
-        x, x1, x2, x3, x4 = features
+        image = features[0]
+        feats = features[1:]  # shallow -> deep, length num_layers
+        n = self.num_layers
+        p = feats[-1]  # deepest (already squeezed)
         outs = []
 
-        if self.use_image_patch_injection:
-            patches = image2patches(x, patch_ref=x4)
-            x4 = torch.cat(
-                (
-                    x4,
-                    self.ipt_blk5(
-                        F.interpolate(
-                            patches,
-                            size=x4.shape[2:],
-                            mode="bilinear",
-                            align_corners=True,
-                        )
-                    ),
-                ),
-                1,
+        for i in range(n - 1):
+            if self.use_image_patch_injection:
+                p = self._inject(image, p, self.ipt_blks[i], p.shape[2:])
+            p = self.decoder_blocks[i](p)
+            if self.use_gradient_attention:
+                p_gdt = self.gdt_convs[i](p)
+                gdt_attn = self.gdt_convs_attn[i](p_gdt).sigmoid()
+                p = p * gdt_attn
+            outs.append(self.conv_ms_spvn[i](p))
+            skip = feats[n - 2 - i]
+            p = F.interpolate(
+                p, size=skip.shape[2:], mode="bilinear", align_corners=True
             )
-
-        p4 = self.decoder_block4(x4)
-
-        if self.use_gradient_attention:
-            p4_gdt = self.gdt_convs_4(p4)
-            gdt_attn_4 = self.gdt_convs_attn_4(p4_gdt).sigmoid()
-            p4 = p4 * gdt_attn_4
-
-        _p4 = F.interpolate(p4, size=x3.shape[2:], mode="bilinear", align_corners=True)
-        _p3 = _p4 + self.lateral_block4(x3)
+            p = p + self.lateral_blocks[i](skip)
 
         if self.use_image_patch_injection:
-            patches = image2patches(x, patch_ref=_p3)
-            _p3 = torch.cat(
-                (
-                    _p3,
-                    self.ipt_blk4(
-                        F.interpolate(
-                            patches,
-                            size=x3.shape[2:],
-                            mode="bilinear",
-                            align_corners=True,
-                        )
-                    ),
-                ),
-                1,
-            )
-
-        p3 = self.decoder_block3(_p3)
-
-        if self.use_gradient_attention:
-            p3_gdt = self.gdt_convs_3(p3)
-            gdt_attn_3 = self.gdt_convs_attn_3(p3_gdt).sigmoid()
-            p3 = p3 * gdt_attn_3
-
-        _p3 = F.interpolate(p3, size=x2.shape[2:], mode="bilinear", align_corners=True)
-        _p2 = _p3 + self.lateral_block3(x2)
-
+            p = self._inject(image, p, self.ipt_blks[n - 1], p.shape[2:])
+        p = self.decoder_blocks[n - 1](p)
+        p = F.interpolate(p, size=image.shape[2:], mode="bilinear", align_corners=True)
         if self.use_image_patch_injection:
-            patches = image2patches(x, patch_ref=_p2)
-            _p2 = torch.cat(
-                (
-                    _p2,
-                    self.ipt_blk3(
-                        F.interpolate(
-                            patches,
-                            size=x2.shape[2:],
-                            mode="bilinear",
-                            align_corners=True,
-                        )
-                    ),
-                ),
-                1,
-            )
-
-        p2 = self.decoder_block2(_p2)
-
-        if self.use_gradient_attention:
-            p2_gdt = self.gdt_convs_2(p2)
-            gdt_attn_2 = self.gdt_convs_attn_2(p2_gdt).sigmoid()
-            p2 = p2 * gdt_attn_2
-
-        _p2 = F.interpolate(p2, size=x1.shape[2:], mode="bilinear", align_corners=True)
-        _p1 = _p2 + self.lateral_block2(x1)
-
-        if self.use_image_patch_injection:
-            patches = image2patches(x, patch_ref=_p1)
-            _p1 = torch.cat(
-                (
-                    _p1,
-                    self.ipt_blk2(
-                        F.interpolate(
-                            patches,
-                            size=x1.shape[2:],
-                            mode="bilinear",
-                            align_corners=True,
-                        )
-                    ),
-                ),
-                1,
-            )
-
-        _p1 = self.decoder_block1(_p1)
-        _p1 = F.interpolate(_p1, size=x.shape[2:], mode="bilinear", align_corners=True)
-
-        if self.use_image_patch_injection:
-            patches = image2patches(x, patch_ref=_p1)
-            _p1 = torch.cat(
-                (
-                    _p1,
-                    self.ipt_blk1(
-                        F.interpolate(
-                            patches,
-                            size=x.shape[2:],
-                            mode="bilinear",
-                            align_corners=True,
-                        )
-                    ),
-                ),
-                1,
-            )
-
-        p1_out = self.conv_out1(_p1)
-        outs.append(p1_out)
+            p = self._inject(image, p, self.ipt_blks[n], image.shape[2:])
+        outs.append(self.conv_out1(p))
         return outs
+
+
+def _remap_legacy_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Remap the pre-0.2.0 custom-Swin key layout to the current layout.
+
+    Backbone: custom Swin keys -> transformers SwinBackbone keys (the fused
+    attn.qkv is split into thirds for q/k/v). Decoder: numbered attributes
+    (decoder_block4..1, ipt_blk5..1, ...) -> ModuleList indices.
+    """
+    out: dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        if "relative_position_index" in k:
+            continue  # non-persistent buffer in the new layout
+        nk = k
+        if k.startswith("bb."):
+            rest = k[len("bb.") :]
+            if rest.startswith("patch_embed.proj."):
+                nk = (
+                    "bb.swin.embeddings.patch_embeddings.projection."
+                    + rest.rsplit(".", 1)[-1]
+                )
+            elif rest.startswith("patch_embed.norm."):
+                nk = "bb.swin.embeddings.norm." + rest.rsplit(".", 1)[-1]
+            elif m := re.match(r"norm(\d+)\.(weight|bias)$", rest):
+                nk = f"bb.hidden_states_norms.stage{int(m.group(1)) + 1}.{m.group(2)}"
+            elif m := re.match(r"layers\.(\d+)\.blocks\.(\d+)\.(.*)$", rest):
+                pre = f"bb.swin.encoder.layers.{m.group(1)}.blocks.{m.group(2)}."
+                sub = m.group(3)
+                if m2 := re.match(r"attn\.qkv\.(weight|bias)$", sub):
+                    q, kk, vv = v.chunk(3, dim=0)
+                    out[pre + f"attention.q_proj.{m2.group(1)}"] = q
+                    out[pre + f"attention.k_proj.{m2.group(1)}"] = kk
+                    out[pre + f"attention.v_proj.{m2.group(1)}"] = vv
+                    continue
+                elif sub.startswith("attn.proj."):
+                    nk = pre + "attention.o_proj." + sub.rsplit(".", 1)[-1]
+                elif sub == "attn.relative_position_bias_table":
+                    nk = (
+                        pre
+                        + "attention.relative_position_bias.relative_position_bias_table"
+                    )
+                elif sub.startswith("norm1."):
+                    nk = pre + "layernorm_before." + sub.rsplit(".", 1)[-1]
+                elif sub.startswith("norm2."):
+                    nk = pre + "layernorm_after." + sub.rsplit(".", 1)[-1]
+                else:  # mlp.fc1 / mlp.fc2
+                    nk = pre + sub
+            elif m := re.match(r"layers\.(\d+)\.downsample\.(.*)$", rest):
+                nk = f"bb.swin.encoder.layers.{m.group(1)}.downsample.{m.group(2)}"
+        elif k.startswith("decoder."):
+            rest = k[len("decoder.") :]
+            if m := re.match(r"decoder_block(\d)\.(.*)$", rest):
+                nk = f"decoder.decoder_blocks.{4 - int(m.group(1))}.{m.group(2)}"
+            elif m := re.match(r"lateral_block(\d)\.(.*)$", rest):
+                nk = f"decoder.lateral_blocks.{4 - int(m.group(1))}.{m.group(2)}"
+            elif m := re.match(r"ipt_blk(\d)\.(.*)$", rest):
+                nk = f"decoder.ipt_blks.{5 - int(m.group(1))}.{m.group(2)}"
+            elif m := re.match(r"conv_ms_spvn_(\d)\.(.*)$", rest):
+                nk = f"decoder.conv_ms_spvn.{4 - int(m.group(1))}.{m.group(2)}"
+            elif m := re.match(r"gdt_convs_pred_(\d)\.(.*)$", rest):
+                nk = f"decoder.gdt_convs_pred.{4 - int(m.group(1))}.{m.group(2)}"
+            elif m := re.match(r"gdt_convs_attn_(\d)\.(.*)$", rest):
+                nk = f"decoder.gdt_convs_attn.{4 - int(m.group(1))}.{m.group(2)}"
+            elif m := re.match(r"gdt_convs_(\d)\.(.*)$", rest):
+                nk = f"decoder.gdt_convs.{4 - int(m.group(1))}.{m.group(2)}"
+        out[nk] = v
+    return out
 
 
 class BiRefNet(
@@ -793,21 +420,35 @@ class BiRefNet(
     Revised_Mixin,
     library_name="nobg",
     repo_url="https://github.com/feyninc/nobg",
+    paper_url="https://arxiv.org/abs/2401.03407",
     tags=["nobg", "birefnet"],
     model_card_template=model_card_template(
-        class_name="BiRefNet", default_repo="nobg/birefnet"
+        class_name="BiRefNet",
+        default_repo="nobg/birefnet",
+        citation=NOBG_CITATION,
     ),
 ):
     """Bilateral Reference Network for high-resolution dichotomous image segmentation."""
 
-    def __init__(self, config: Optional[BiRefNetConfig] = BiRefNetConfig()):
+    def __init__(self, config: Optional[BiRefNetConfig] = None):
         super().__init__()
         self.config = config or BiRefNetConfig()
 
-        self.bb = SwinBackbone(self.config)
+        swin_config = SwinConfig(
+            image_size=self.config.image_size,
+            patch_size=self.config.patch_size,
+            embed_dim=self.config.embed_dim,
+            depths=self.config.depths,
+            num_heads=self.config.num_heads,
+            window_size=self.config.window_size,
+            mlp_ratio=self.config.mlp_ratio,
+            drop_path_rate=self.config.drop_path_rate,
+            out_features=[f"stage{i + 1}" for i in range(self.config.num_layers)],  # ty: ignore[unknown-argument]
+        )
+        self.bb = SwinBackbone(swin_config)
 
         base_channels = [
-            self.config.embed_dim * (2**i) for i in range(len(self.config.depths))
+            self.config.embed_dim * (2**i) for i in range(self.config.num_layers)
         ]
 
         if self.config.use_multi_scale_input:
@@ -815,97 +456,156 @@ class BiRefNet(
         else:
             channels = base_channels
 
-        # channels = [C1, C2, C3, C4] shallow->deep
-        # Decoder expects reversed: [C4, C3, C2, C1] deep->shallow
+        # channels = [C1 .. Cn] shallow->deep; the decoder expects deep->shallow
         dec_channels = list(reversed(channels))
 
-        # Context: concat x1..x3 downsampled to x4 size, then cat with x4
-        cxt_channels = channels[:-1]  # [C1, C2, C3]
-
-        # Squeeze module: takes x4 with context concatenated
-        squeeze_in = channels[-1] + sum(cxt_channels)
+        # Squeeze module: deepest feature with all shallower features
+        # downsampled and concatenated onto it.
+        squeeze_in = channels[-1] + sum(channels[:-1])
         self.squeeze_module = nn.Sequential(
             BasicDecBlk(squeeze_in, dec_channels[0], self.config.dec_channels_inter)
         )
 
         self.decoder = Decoder(dec_channels, self.config)
 
+        # Loss used when `labels` is passed to forward(). Plain function
+        # attribute (not a submodule), so it never enters the state dict and
+        # can be hot-swapped: `model.criterion = my_loss`.
+        self.criterion = birefnet_loss
+
     def forward(
         self, pixel_values: torch.Tensor, labels: Optional[torch.Tensor] = None
     ) -> dict[str, Union[torch.Tensor, list[torch.Tensor]]]:
         x = pixel_values
-        x1, x2, x3, x4 = self.bb(x)
+        feats = list(self.bb(x).feature_maps)
 
         if self.config.use_multi_scale_input:
             _, _, H, W = x.shape
             x_half = F.interpolate(
                 x, size=(H // 2, W // 2), mode="bilinear", align_corners=True
             )
-            x1_, x2_, x3_, x4_ = self.bb(x_half)
-            x1 = torch.cat(
-                [
-                    x1,
-                    F.interpolate(
-                        x1_, size=x1.shape[2:], mode="bilinear", align_corners=True
-                    ),
-                ],
-                dim=1,
-            )
-            x2 = torch.cat(
-                [
-                    x2,
-                    F.interpolate(
-                        x2_, size=x2.shape[2:], mode="bilinear", align_corners=True
-                    ),
-                ],
-                dim=1,
-            )
-            x3 = torch.cat(
-                [
-                    x3,
-                    F.interpolate(
-                        x3_, size=x3.shape[2:], mode="bilinear", align_corners=True
-                    ),
-                ],
-                dim=1,
-            )
-            x4 = torch.cat(
-                [
-                    x4,
-                    F.interpolate(
-                        x4_, size=x4.shape[2:], mode="bilinear", align_corners=True
-                    ),
-                ],
-                dim=1,
-            )
+            feats_half = self.bb(x_half).feature_maps
+            feats = [
+                torch.cat(
+                    [
+                        f,
+                        F.interpolate(
+                            fh, size=f.shape[2:], mode="bilinear", align_corners=True
+                        ),
+                    ],
+                    dim=1,
+                )
+                for f, fh in zip(feats, feats_half)
+            ]
 
-        # Context aggregation
-        x4 = torch.cat(
-            (
+        # Context aggregation: all shallower features downsampled onto the deepest
+        deepest = feats[-1]
+        context = torch.cat(
+            [
                 F.interpolate(
-                    x1, size=x4.shape[2:], mode="bilinear", align_corners=True
-                ),
-                F.interpolate(
-                    x2, size=x4.shape[2:], mode="bilinear", align_corners=True
-                ),
-                F.interpolate(
-                    x3, size=x4.shape[2:], mode="bilinear", align_corners=True
-                ),
-                x4,
-            ),
+                    f, size=deepest.shape[2:], mode="bilinear", align_corners=True
+                )
+                for f in feats[:-1]
+            ]
+            + [deepest],
             dim=1,
         )
+        feats[-1] = self.squeeze_module(context)
 
-        x4 = self.squeeze_module(x4)
-
-        scaled_preds = self.decoder([pixel_values, x1, x2, x3, x4])
+        scaled_preds = self.decoder([pixel_values, *feats])
 
         logits = scaled_preds[-1]
         if labels is not None:
-            loss = birefnet_loss(scaled_preds, labels)
+            loss = self.criterion(scaled_preds, labels)
             return {
                 "loss": loss,
                 "logits": logits,
                 "intermediate_logits": scaled_preds[:-1],
             }
         return {"logits": logits, "intermediate_logits": scaled_preds[:-1]}
+
+    @classmethod
+    def from_origin(
+        cls,
+        origin: Union[str, os.PathLike, nn.Module],
+        config: Optional[BiRefNetConfig] = None,
+        *,
+        token: Optional[str] = None,
+        **overrides,
+    ) -> "BiRefNet":
+        """Build a (possibly re-parameterized) BiRefNet from a previous model.
+
+        `origin` is a Hub repo id, a local directory containing
+        `config.json` + `model.safetensors`, or an `nn.Module` instance.
+        The origin's config fields are merged with `overrides` (or replaced
+        entirely by `config`), the new model is constructed, and every origin
+        weight whose (remapped) key and shape match is injected; anything new
+        or reshaped keeps its fresh initialization. Understands both the
+        current key layout and the pre-0.2.0 custom-Swin layout.
+        """
+        if isinstance(origin, nn.Module):
+            state_dict = origin.state_dict()
+            origin_config = getattr(origin, "config", None)
+            origin_fields = (
+                {f.name: getattr(origin_config, f.name) for f in fields(origin_config)}
+                if origin_config is not None
+                and hasattr(origin_config, "__dataclass_fields__")
+                else {}
+            )
+        else:
+            import json
+
+            from huggingface_hub import hf_hub_download
+            from safetensors.torch import load_file
+
+            origin = str(origin)
+            if os.path.isdir(origin):
+                config_path = os.path.join(origin, "config.json")
+                weights_path = os.path.join(origin, "model.safetensors")
+            else:
+                config_path = hf_hub_download(origin, "config.json", token=token)
+                weights_path = hf_hub_download(origin, "model.safetensors", token=token)
+            with open(config_path) as f:
+                origin_fields = json.load(f)
+            state_dict = load_file(weights_path)
+
+        if config is None:
+            known = {f.name for f in fields(BiRefNetConfig)}
+            merged = {k: v for k, v in origin_fields.items() if k in known}
+            merged.update(overrides)
+            merged["nobg_version"] = overrides.get("nobg_version", NOBG_VERSION)
+            if "depths" in merged and "num_layers" not in overrides:
+                merged["num_layers"] = len(merged["depths"])
+            config = BiRefNetConfig(**merged)
+        elif overrides:
+            raise ValueError(
+                "pass either an explicit `config` or field overrides, not both"
+            )
+
+        model = cls(config)
+
+        is_legacy = any(k.startswith("bb.patch_embed.") for k in state_dict)
+        if is_legacy:
+            state_dict = _remap_legacy_state_dict(state_dict)
+
+        target = model.state_dict()
+        compatible = {}
+        skipped_shape = []
+        for k, v in state_dict.items():
+            if k in target and target[k].shape == v.shape:
+                compatible[k] = v
+            elif k in target:
+                skipped_shape.append(k)
+        missing = [k for k in target if k not in compatible]
+        model.load_state_dict(compatible, strict=False)
+
+        logger.info(
+            "from_origin: injected %d/%d tensors (%d shape-mismatched, "
+            "%d fresh-initialized)%s",
+            len(compatible),
+            len(target),
+            len(skipped_shape),
+            len(missing),
+            " [legacy layout remapped]" if is_legacy else "",
+        )
+        return model
