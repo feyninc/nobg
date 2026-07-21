@@ -3,6 +3,7 @@ import torch
 from nobg.metrics import (
     accuracy,
     ber,
+    boundary_iou,
     connectivity_error,
     dice,
     e_measure_max,
@@ -37,6 +38,7 @@ class TestMetrics:
         p = g.clone()
         assert mae(p, g).item() < 1e-6
         assert iou_metric(p, g).item() > 0.999
+        assert boundary_iou(p, g).item() > 0.999
         assert dice(p, g).item() > 0.999
         assert accuracy(p, g).item() > 0.999
         assert ber(p, g).item() < 1e-6
@@ -54,6 +56,7 @@ class TestMetrics:
         p = _mask("right")
         assert mae(p, g).item() > 0.9
         assert iou_metric(p, g).item() < 1e-6
+        assert boundary_iou(p, g).item() < 1e-6
         assert dice(p, g).item() < 1e-6
         assert s_measure(p, g).item() < 0.5
         assert weighted_f_measure(p, g).item() < 0.2
@@ -119,6 +122,7 @@ class TestMetrics:
         for fn in (
             mae,
             iou_metric,
+            boundary_iou,
             dice,
             accuracy,
             ber,
@@ -136,3 +140,14 @@ class TestMetrics:
             v = fn(p, g)
             assert v.ndim == 0
             assert torch.isfinite(v).item()
+
+    def test_boundary_iou_sensitive_to_shift(self):
+        # A shifted blob keeps high region IoU but boundary IoU should drop
+        # sharply — the reason mBIoU is added (region metrics miss edge errors).
+        size = 128
+        g = torch.zeros(1, 1, size, size)
+        g[..., 32:96, 32:96] = 1.0
+        p = torch.zeros(1, 1, size, size)
+        p[..., 36:100, 36:100] = 1.0  # shifted by 4 px
+        assert iou_metric(p, g).item() > 0.7
+        assert boundary_iou(p, g).item() < iou_metric(p, g).item()

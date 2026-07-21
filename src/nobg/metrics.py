@@ -17,7 +17,8 @@ The matting metrics (``sad``, ``mse_metric``, ``gradient_error``,
 ``pred`` at a threshold, the matting metrics use the soft values directly.
 
 Cost tiers:
-    cheap  O(N)   : mae, iou_metric, dice, accuracy, ber, sad, mse_metric
+    cheap  O(N)   : mae, iou_metric, dice, accuracy, ber, sad, mse_metric,
+                    boundary_iou (a few pooling ops)
     medium O(N*T) : f_measure_max/mean, e_measure_max/mean (histogram based),
                     gradient_error (two separable convolutions)
     expensive     : s_measure, weighted_f_measure, connectivity_error
@@ -27,6 +28,13 @@ Cost tiers:
                     its connected components via pure-torch label propagation
                     rather than the reference scipy labelling, so absolute
                     values differ slightly from the official numpy tools).
+
+Boundary quality:
+    ``boundary_iou`` (Cheng et al., "Boundary IoU", CVPR 2021) is the standard
+    boundary-quality metric (HQSeg-44K reports it as mBIoU). It is region-metric
+    blind to interior errors, so it separates near-saturated models (HRSOD /
+    UHRSD / DAVIS-S) that plain IoU / S-measure cannot. Pure-torch: the boundary
+    band is ``mask XOR erode(mask)``, with erosion implemented as min-pooling.
 """
 
 import torch
@@ -86,6 +94,47 @@ def ber(pred: torch.Tensor, gt: torch.Tensor, threshold: float = 0.5) -> torch.T
     fpr = fp / (fp + tn + EPS)
     fnr = fn / (fn + tp + EPS)
     return (0.5 * (fpr + fnr)).mean()
+
+
+def _erode(mask: torch.Tensor, iterations: int) -> torch.Tensor:
+    """Binary erosion of a ``(B, 1, H, W)`` {0,1} mask via 3x3 min-pooling.
+
+    ``iterations`` steps of a 3x3 structuring element = erosion by a
+    Chebyshev-radius-``iterations`` square (min-pool is erosion for binary maps).
+    """
+    if iterations <= 0:
+        return mask
+    x = mask
+    for _ in range(iterations):
+        x = -F.max_pool2d(-x, kernel_size=3, stride=1, padding=1)
+    return x
+
+
+def boundary_iou(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    threshold: float = 0.5,
+    dilation_ratio: float = 0.02,
+) -> torch.Tensor:
+    """Boundary IoU (Cheng et al., CVPR 2021); reported as mBIoU on HQSeg-44K.
+
+    IoU computed only over a thin band around each mask's contour, so interior
+    agreement does not mask boundary errors. The band width per image is
+    ``round(dilation_ratio * image_diagonal)`` (min 1), matching the reference
+    implementation's ``dilation_ratio`` (default 0.02). The boundary region is
+    ``mask XOR erode(mask, width)``. Binarizes ``pred`` at ``threshold``.
+    Averaged over the batch.
+    """
+    h, w = pred.shape[-2:]
+    d = int(round(dilation_ratio * ((h**2 + w**2) ** 0.5)))
+    d = max(d, 1)
+    p = (pred >= threshold).float()
+    g = (gt >= 0.5).float()
+    p_bnd = (p - _erode(p, d)).clamp(0, 1)
+    g_bnd = (g - _erode(g, d)).clamp(0, 1)
+    inter = (p_bnd * g_bnd).sum(dim=(1, 2, 3))
+    union = p_bnd.sum(dim=(1, 2, 3)) + g_bnd.sum(dim=(1, 2, 3)) - inter
+    return (inter / (union + EPS)).mean()
 
 
 # --------------------------------------------------------------------------- #

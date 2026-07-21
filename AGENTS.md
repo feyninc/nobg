@@ -120,6 +120,24 @@ Required test coverage for every model:
 
 Tests must be local-only (no network calls). Use `tmp_path` for filesystem operations. Use `@pytest.fixture` for expensive setup (reduced-size configs for large models).
 
+## Image Processors
+
+A model may ship an image processor that encapsulates its pre/post-processing.
+
+- File: `src/nobg/<model_name>/image_processing_<model_name>.py`; class
+  `<ModelName>ImageProcessor` subclasses `transformers.image_processing_backends.TorchvisionBackend`.
+- Defaults live as **class attributes** (`resample`, `image_mean`, `image_std`, `size`,
+  `do_resize`, `do_rescale`, `rescale_factor`, `do_normalize`, ...). This is a deliberate
+  exception to the dataclass-config rule: transformers' `preprocessor_config.json`
+  (written by `save_pretrained`, read by `from_pretrained`) IS the serialization schema.
+- Do **not** override `from_pretrained`/`save_pretrained` (transformers handles them). A small
+  `push_to_hub` override to auto-prefix the username (mirroring `Revised_Mixin`) is allowed.
+- Every processor is exported from `src/nobg/__init__.py` and dispatched by `AutoProcessor`
+  (in `auto.py`) on the **same Hub tags** as `AutoModel`.
+- Tests: `tests/test_image_processing_<model_name>.py`, one `class Test<ModelName>ImageProcessor`,
+  local-only (`tmp_path`, no network — `AutoProcessor.from_pretrained` needs `model_info`, so
+  leave it untested like `AutoModel`).
+
 ## Linting and Type Checking
 
 - **Formatter/linter**: `ruff` (check + format)
@@ -131,7 +149,9 @@ Tests must be local-only (no network calls). Use `tmp_path` for filesystem opera
 
 - `torch>=2.0` — core framework
 - `huggingface_hub>=1.22.0` — Hub integration and mixin
-- `transformers>=5.0` — reusable building blocks (e.g., `GPT2Block`)
+- `transformers[torch]>=5.4` — reusable building blocks (e.g. `SwinBackbone`) and the
+  `TorchvisionBackend` image-processor base (which landed in 5.4)
+- `torchvision>=0.27.1`
 
 Models may import sub-components from `transformers` but must wrap them behind the nobg config dataclass — the user-facing config is always the nobg `@dataclass`, never a transformers config object directly. When a transformers sub-component requires its own config object (e.g., `GPT2Config`), construct that config object inside `__init__` from `self.config` fields; it must never be stored on `self` or exposed publicly. Example: `gpt2_cfg = GPT2Config(n_embd=self.config.hidden_size, n_layer=self.config.num_layers); self.block = GPT2Block(gpt2_cfg)`.
 
