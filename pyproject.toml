@@ -1,9 +1,9 @@
 [project]
 name = "nobg"
 dynamic = ["version"]
-description = "Open source background removal models for image and video matting"
+description = "Open source background removal models for image matting"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.13"
 authors = [
     { name = "Hafedh Hichri", email = "lain@chonkie.ai" },
@@ -13,7 +13,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -22,22 +21,23 @@ classifiers = [
 dependencies = [
     "torch>=2.0",
     "huggingface_hub>=1.22.0",
-    "transformers[torch]>=5.0",
+    "transformers[torch]>=5.4",
     "torchvision>=0.27.1",
     "loadimg>=0.5.0",
     "datasets>=5.0.0",
+    "ty>=0.0.61",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.0",
     "ruff>=0.15",
-    "ty>=0.0.57",
+    "ty>=0.0.61",
 ]
 notebooks = [
     "jupyter>=1.0",
     "ipykernel>=6.0",
-    "matplotlib>=3.0",
+    "matplotlib>=3.11.1",
 ]
 train = [
     "python-dotenv>=1.0",

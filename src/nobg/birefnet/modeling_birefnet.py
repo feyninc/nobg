@@ -2,6 +2,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field, fields
+from importlib.metadata import PackageNotFoundError, version
 from typing import Optional, Union
 
 import torch
@@ -17,14 +18,19 @@ from ..utils import model_card_template
 
 logger = logging.getLogger(__name__)
 
-NOBG_VERSION = "0.2.0"
+try:
+    NOBG_VERSION = version("nobg")
+except PackageNotFoundError:  # running from source without an installed dist
+    NOBG_VERSION = "0.0.0+unknown"
 
-NOBG_CITATION = """@software{nobg,
-  title={nobg: Open Source Background Removal Models for Image and Video Matting},
-  author={Hichri, Hafedh},
-  year={2026},
-  url={https://github.com/feyninc/nobg},
-  license={MIT},
+BIREFNET_CITATION = """@article{zheng2024birefnet,
+  title={Bilateral Reference for High-Resolution Dichotomous Image Segmentation},
+  author={Zheng, Peng and Gao, Dehong and Fan, Deng-Ping and Liu, Li and Laaksonen, Jorma and Ouyang, Wanli and Sebe, Nicu},
+  journal={CAAI Artificial Intelligence Research},
+  volume={3},
+  pages={9150038},
+  year={2024},
+  url={https://arxiv.org/abs/2401.03407},
 }"""
 
 
@@ -425,7 +431,7 @@ class BiRefNet(
     model_card_template=model_card_template(
         class_name="BiRefNet",
         default_repo="nobg/birefnet",
-        citation=NOBG_CITATION,
+        citation=BIREFNET_CITATION,
     ),
 ):
     """Bilateral Reference Network for high-resolution dichotomous image segmentation."""
