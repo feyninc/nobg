@@ -441,14 +441,14 @@ class BiRefNet(
         self.config = config or BiRefNetConfig()
 
         swin_config = SwinConfig(
-            image_size=self.config.image_size,  # ty: ignore[unknown-argument]
-            patch_size=self.config.patch_size,  # ty: ignore[unknown-argument]
-            embed_dim=self.config.embed_dim,  # ty: ignore[unknown-argument]
-            depths=self.config.depths,  # ty: ignore[unknown-argument]
-            num_heads=self.config.num_heads,  # ty: ignore[unknown-argument]
-            window_size=self.config.window_size,  # ty: ignore[unknown-argument]
-            mlp_ratio=self.config.mlp_ratio,  # ty: ignore[unknown-argument]
-            drop_path_rate=self.config.drop_path_rate,  # ty: ignore[unknown-argument]
+            image_size=self.config.image_size,
+            patch_size=self.config.patch_size,
+            embed_dim=self.config.embed_dim,
+            depths=self.config.depths,
+            num_heads=self.config.num_heads,
+            window_size=self.config.window_size,
+            mlp_ratio=self.config.mlp_ratio,
+            drop_path_rate=self.config.drop_path_rate,
             out_features=[f"stage{i + 1}" for i in range(self.config.num_layers)],  # ty: ignore[unknown-argument]
         )
         self.bb = SwinBackbone(swin_config)
