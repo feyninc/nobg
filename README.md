@@ -17,7 +17,7 @@ Automatically detect and load the correct model architecture from a HuggingFace 
 ```python
 from nobg import AutoModel
 
-model = AutoModel.from_pretrained("nobg/BiRefNet")
+model = AutoModel.from_pretrained("feyninc/BiRefNet")
 ```
 
 ### Load a specific model
@@ -25,7 +25,7 @@ model = AutoModel.from_pretrained("nobg/BiRefNet")
 ```python
 from nobg import AutoModel
 
-model = AutoModel.from_pretrained("nobg/BiRefNet")
+model = AutoModel.from_pretrained("feyninc/BiRefNet")
 ```
 
 ### AutoProcessor
@@ -37,12 +37,12 @@ into an alpha matte at the original resolution on the way out.
 ```python
 from nobg import AutoProcessor
 
-processor = AutoProcessor.from_pretrained("nobg/FeyNobg")
+processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
 ```
 
 ### Remove a background with FeyNobg
 
-`nobg/FeyNobg` is the strongest published model. The processor produces the
+`feyninc/FeyNobg` is the strongest published model. The processor produces the
 normalized `pixel_values` the model expects and post-processes the raw logits
 `(B, 1, 1024, 1024)` into an alpha matte you can composite onto the image.
 
@@ -52,8 +52,8 @@ from loadimg import load_img
 
 from nobg import AutoModel, AutoProcessor
 
-model = AutoModel.from_pretrained("nobg/FeyNobg").eval()
-processor = AutoProcessor.from_pretrained("nobg/FeyNobg")
+model = AutoModel.from_pretrained("feyninc/FeyNobg").eval()
+processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
 
 image = load_img("input.jpg").convert("RGB")
 inputs = processor(image, return_tensors="pt")
