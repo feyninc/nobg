@@ -427,6 +427,7 @@ class BiRefNet(
     library_name="nobg",
     repo_url="https://github.com/feyninc/nobg",
     paper_url="https://arxiv.org/abs/2401.03407",
+    license="mit",
     tags=["nobg", "birefnet"],
     model_card_template=model_card_template(
         class_name="BiRefNet",
