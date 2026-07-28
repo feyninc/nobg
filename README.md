@@ -165,6 +165,7 @@ from nobg import AutoProcessor, AutoModel
 model = AutoModel.from_pretrained("nobg/FeyNobg")
 processor = AutoProcessor.from_pretrained("nobg/FeyNobg")
 
+
 def collate(examples):
     batch = processor(
         images=[ex["image"] for ex in examples],
@@ -172,6 +173,7 @@ def collate(examples):
         return_tensors="pt",
     )
     return {"pixel_values": batch["pixel_values"], "labels": batch["labels"]}
+
 
 trainer = Trainer(
     model=model,
@@ -191,8 +193,12 @@ enters the state dict and you can replace it outright:
 ```python
 from nobg.loss import birefnet_loss, iou_loss, ssim_loss
 
+
 def my_loss(scaled_preds, gt):
-    return birefnet_loss(scaled_preds, gt) + 5 * iou_loss(scaled_preds[-1].sigmoid(), gt)
+    return birefnet_loss(scaled_preds, gt) + 5 * iou_loss(
+        scaled_preds[-1].sigmoid(), gt
+    )
+
 
 model.criterion = my_loss
 ```
