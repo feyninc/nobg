@@ -126,7 +126,7 @@ def boundary_iou(
     Averaged over the batch.
     """
     h, w = pred.shape[-2:]
-    d = int(round(dilation_ratio * ((h**2 + w**2) ** 0.5)))
+    d = round(dilation_ratio * ((h**2 + w**2) ** 0.5))
     d = max(d, 1)
     p = (pred >= threshold).float()
     g = (gt >= 0.5).float()

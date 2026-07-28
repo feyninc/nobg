@@ -6,9 +6,8 @@ import pytest
 import torch
 from PIL import Image
 
-from nobg import AutoProcessor, BiRefNetImageProcessor
+from nobg import AutoProcessor, BiRefNet, BiRefNetImageProcessor
 from nobg.birefnet.modeling_birefnet import BiRefNetConfig
-from nobg import BiRefNet
 
 
 class TestBiRefNetImageProcessor:

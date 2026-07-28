@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 import torch.nn.functional as F
@@ -32,7 +32,9 @@ class BiRefNetImageProcessor(TorchvisionBackend):
     resample = PILImageResampling.BILINEAR
     image_mean = IMAGENET_DEFAULT_MEAN
     image_std = IMAGENET_DEFAULT_STD
-    size = {"height": 1024, "width": 1024}
+    # transformers reads/writes this class attr as part of the
+    # preprocessor_config.json schema, so a dict default is the required shape.
+    size = {"height": 1024, "width": 1024}  # noqa: RUF012
     default_to_square = True
     do_convert_rgb = True
     do_resize = True
@@ -46,7 +48,7 @@ class BiRefNetImageProcessor(TorchvisionBackend):
     def preprocess(
         self,
         images: ImageInput,
-        segmentation_maps: Optional[ImageInput] = None,
+        segmentation_maps: ImageInput | None = None,
         **kwargs: Unpack[ImagesKwargs],
     ) -> BatchFeature:
         return super().preprocess(images, segmentation_maps, **kwargs)
@@ -54,11 +56,11 @@ class BiRefNetImageProcessor(TorchvisionBackend):
     def _preprocess_image_like_inputs(  # ty: ignore[invalid-method-override]
         self,
         images: ImageInput,
-        segmentation_maps: Optional[ImageInput],
+        segmentation_maps: ImageInput | None,
         do_convert_rgb: bool,
         input_data_format: ChannelDimension,
-        return_tensors: Optional[Union[str, TensorType]],
-        device: Optional[Union[str, "torch.device"]] = None,
+        return_tensors: str | TensorType | None,
+        device: Union[str, "torch.device"] | None = None,
         **kwargs,
     ) -> BatchFeature:
         images = self._prepare_image_like_inputs(
@@ -93,7 +95,7 @@ class BiRefNetImageProcessor(TorchvisionBackend):
     def post_process_alpha_matting(
         self,
         outputs,
-        target_sizes: Optional[list[tuple[int, int]]] = None,
+        target_sizes: list[tuple[int, int]] | None = None,
     ) -> list[torch.Tensor]:
         """Convert raw BiRefNet logits into per-image alpha mattes in ``[0, 1]``.
 

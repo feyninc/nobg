@@ -1,6 +1,6 @@
 import json
 
-from huggingface_hub import hf_hub_download, model_info, PyTorchModelHubMixin
+from huggingface_hub import PyTorchModelHubMixin, hf_hub_download, model_info
 from transformers.image_processing_base import ImageProcessingMixin
 
 from .birefnet.image_processing_birefnet import BiRefNetImageProcessor

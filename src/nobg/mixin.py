@@ -1,14 +1,10 @@
-from huggingface_hub import PyTorchModelHubMixin, whoami
-from .utils import set_doc
+from __future__ import annotations
 
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Union,
-)
+from typing import TYPE_CHECKING, Any
+
+from huggingface_hub import PyTorchModelHubMixin, whoami
+
+from .utils import set_doc
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -20,16 +16,16 @@ class Revised_Mixin(PyTorchModelHubMixin):
         self,
         repo_id: str,
         *,
-        config: Optional[Union[dict, "DataclassInstance"]] = None,
+        config: dict | DataclassInstance | None = None,
         commit_message: str = "Push model using huggingface_hub.",
-        private: Optional[bool] = None,
-        token: Optional[str] = None,
-        branch: Optional[str] = None,
-        create_pr: Optional[bool] = None,
-        allow_patterns: Optional[Union[List[str], str]] = None,
-        ignore_patterns: Optional[Union[List[str], str]] = None,
-        delete_patterns: Optional[Union[List[str], str]] = None,
-        model_card_kwargs: Optional[Dict[str, Any]] = None,
+        private: bool | None = None,
+        token: str | None = None,
+        branch: str | None = None,
+        create_pr: bool | None = None,
+        allow_patterns: list[str] | str | None = None,
+        ignore_patterns: list[str] | str | None = None,
+        delete_patterns: list[str] | str | None = None,
+        model_card_kwargs: dict[str, Any] | None = None,
     ) -> str:
         if model_card_kwargs is None:
             model_card_kwargs = {}

@@ -1,10 +1,11 @@
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from nobg import BiRefNet, AutoModel
+from nobg import AutoModel, BiRefNet, auto
 from nobg.birefnet.modeling_birefnet import BiRefNetConfig
 
 
@@ -177,6 +178,9 @@ class TestBiRefNet:
 
 
 class TestAutoModel:
-    def test_automodel_raises_on_unknown(self):
-        with pytest.raises(Exception):
+    def test_automodel_raises_on_unknown(self, monkeypatch):
+        monkeypatch.setattr(
+            auto, "model_info", lambda *a, **k: SimpleNamespace(tags=["not-a-nobg-tag"])
+        )
+        with pytest.raises(ValueError, match="not part of nobg"):
             AutoModel.from_pretrained("nonexistent/repo-that-does-not-exist")

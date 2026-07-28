@@ -3,11 +3,10 @@ import os
 import re
 from dataclasses import dataclass, field, fields
 from importlib.metadata import PackageNotFoundError, version
-from typing import Optional, Union
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torchvision.ops import deform_conv2d
 from transformers import SwinConfig
 from transformers.models.swin.modeling_swin import SwinBackbone
@@ -437,7 +436,7 @@ class BiRefNet(
 ):
     """Bilateral Reference Network for high-resolution dichotomous image segmentation."""
 
-    def __init__(self, config: Optional[BiRefNetConfig] = None):
+    def __init__(self, config: BiRefNetConfig | None = None):
         super().__init__()
         self.config = config or BiRefNetConfig()
 
@@ -481,8 +480,8 @@ class BiRefNet(
         self.criterion = birefnet_loss
 
     def forward(
-        self, pixel_values: torch.Tensor, labels: Optional[torch.Tensor] = None
-    ) -> dict[str, Union[torch.Tensor, list[torch.Tensor]]]:
+        self, pixel_values: torch.Tensor, labels: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         x = pixel_values
         feats = list(self.bb(x).feature_maps)
 
@@ -534,10 +533,10 @@ class BiRefNet(
     @classmethod
     def from_origin(
         cls,
-        origin: Union[str, os.PathLike, nn.Module],
-        config: Optional[BiRefNetConfig] = None,
+        origin: str | os.PathLike | nn.Module,
+        config: BiRefNetConfig | None = None,
         *,
-        token: Optional[str] = None,
+        token: str | None = None,
         **overrides,
     ) -> "BiRefNet":
         """Build a (possibly re-parameterized) BiRefNet from a previous model.
