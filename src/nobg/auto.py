@@ -14,7 +14,7 @@ class AutoModel:
     @set_doc(PyTorchModelHubMixin.from_pretrained.__doc__)
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         tags: list[str] = model_info(pretrained_model_name_or_path).tags or []
-        if "birefnet" in tags:
+        if "biref" in tags or "birefnet" in tags:
             return BiRefNet.from_pretrained(
                 pretrained_model_name_or_path, *model_args, **kwargs
             )
@@ -52,7 +52,7 @@ class AutoProcessor:
     @staticmethod
     def _from_model_config(pretrained_model_name_or_path, **kwargs):
         tags: list[str] = model_info(pretrained_model_name_or_path).tags or []
-        if "birefnet" not in tags:
+        if "biref" not in tags and "birefnet" not in tags:
             raise ValueError("this model is not part of nobg")
         config_file = hf_hub_download(
             pretrained_model_name_or_path,
