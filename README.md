@@ -30,7 +30,9 @@
 - [Model Zoo](#model-zoo)
 - [Usage](#usage)
   - [AutoModel & AutoProcessor](#automodel--autoprocessor)
+  - [SAM3: text-promptable cutouts](#sam3-text-promptable-cutouts)
   - [Batched inference](#batched-inference)
+  - [Refining the foreground](#refining-the-foreground)
   - [GPU & half precision](#gpu--half-precision)
   - [Fine-tuning on custom data](#fine-tuning-on-custom-data)
   - [Re-parameterizing a checkpoint](#re-parameterizing-a-checkpoint)
@@ -60,15 +62,52 @@ Requires Python ≥ 3.10 and `torch` ≥ 2.0. See [`pyproject.toml`](https://git
 
 ## Quick Start
 
-Remove a background in ten lines:
+Remove a background in three lines:
+
+```python
+from nobg import AutoModel
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg")
+model.process("input.jpg").save("output.png")
+```
+
+`process` handles the whole pipeline — load, preprocess, forward under `no_grad` in eval
+mode, post-process, composite — and builds the processor the model's own config implies, so
+there is nothing else to load. `image` takes anything
+[`loadimg`](https://github.com/not-lain/loadimg) accepts: a path, URL, base64 string, numpy
+array or PIL image. Pass a list to get a list back, each matte returned at its own original
+resolution:
+
+```python
+for cut, path in zip(model.process(["a.jpg", "b.jpg"]), ("a.png", "b.png")):
+    cut.save(path)
+```
+
+Useful keywords: `batch_size` (images per forward pass; defaults to 1 to keep peak memory
+flat), `return_type="alpha"` for the raw `(H, W)` matte tensors instead of RGBA cutouts, and
+any remaining kwargs go to the processor.
+
+`predict` is the same call with the processor passed in — reach for it when you already have
+one, or when a checkpoint's `preprocessor_config.json` differs from its `config.image_size`
+(`process` trusts the model config):
+
+```python
+from nobg import AutoProcessor
+
+processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
+model.predict(processor, "input.jpg").save("output.png")
+```
+
+The processor comes first, then the inputs that vary: `predict(processor, image, prompt,
+boxes)`, each one optional after `image` (BiRefNet takes neither prompt nor boxes; SAM3 takes
+both). `model.default_processor()` returns the one `process` would build, if you want it
+without the Hub round-trip.
+
+Or drive the steps yourself when you need the intermediates:
 
 ```python
 import torch
 from loadimg import load_img
-from nobg import AutoModel, AutoProcessor
-
-model = AutoModel.from_pretrained("feyninc/FeyNobg").eval()
-processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
 
 image = load_img("input.jpg").convert("RGB")
 inputs = processor(image, return_tensors="pt")
@@ -89,6 +128,7 @@ Or try it in the browser first: **[🤗 FeyNobg Space](https://huggingface.co/sp
 | Model | Repo | Params | Resolution | Task | Notes |
 |:------|:-----|:------:|:----------:|:-----|:------|
 | **FeyNobg** | [`feyninc/FeyNobg`](https://huggingface.co/feyninc/FeyNobg) | 0.3 B | 1024 × 1024 | Background removal / matting | Strongest published model, start here |
+| **SAM3** | [`facebook/sam3`](https://huggingface.co/facebook/sam3) | 0.84 B | 1008 × 1008 | Background removal + text-promptable segmentation | Load with `Sam3.from_origin`. Picks the subject well; edges stay softer than FeyNobg. Gated; weights are under Meta's [SAM License](https://huggingface.co/facebook/sam3/blob/main/LICENSE) |
 
 ## Usage
 
@@ -123,13 +163,137 @@ from nobg.birefnet.modeling_birefnet import BiRefNetConfig
 model = BiRefNet(BiRefNetConfig(image_size=512, embed_dim=128))
 ```
 
-### Batched inference
+### SAM3: text-promptable cutouts
 
-Pass a list of images; `post_process_alpha_matting` takes one target size per image,
-so mattes come back at each original resolution.
+`Sam3` wraps [`transformers`' SAM3](https://huggingface.co/docs/transformers/model_doc/sam3)
+and exposes its prompt-conditioned segmentation as a single alpha matte, so it drops into the
+same flow as BiRefNet:
 
 ```python
-images = [load_img(p).convert("RGB") for p in ("a.jpg", "b.jpg", "c.jpg")]
+from nobg import Sam3
+
+model = Sam3.from_origin("facebook/sam3")
+model.process("input.jpg").save("output.png")
+```
+
+Because SAM3 is open-vocabulary, you can cut out *specific* things by passing a prompt as
+the second argument — this is the capability BiRefNet doesn't have:
+
+```python
+model.process("input.jpg", "the dog").save("dog.png")
+```
+
+With no `prompt`, the processor supplies `default_prompt` (`"the main foreground subject"`),
+which is what makes prompt-free background removal work.
+
+The third argument is `boxes` — a visual prompt, in the original image's pixel
+coordinates. Use it when the thing you want is easier to point at than to name:
+
+```python
+model.process("input.jpg", None, [[120, 80, 460, 720]]).save("cutout.png")
+```
+
+Unlike `prompt`, `boxes` is **per-image**: pass `[[x1, y1, x2, y2], ...]` for one image, or
+one such list per image for a batch. Boxes and a prompt can be combined; with boxes and no
+prompt, SAM3 segments what the boxes point at.
+
+```python
+images = ["a.jpg", "b.jpg"]
+boxes = [[[10, 10, 200, 300]], [[40, 60, 380, 500], [400, 20, 620, 260]]]
+cuts = model.process(images, "the dog", boxes)
+```
+
+`process` builds its processor from the model config: image size and `default_prompt` come
+straight from it, and the CLIP tokenizer is loaded from whatever repo `from_origin` read the
+weights from, falling back to the ungated `openai/clip-vit-large-patch14` (SAM3's text tower
+*is* CLIP's). Pass `tokenizer=` a repo id, a directory or an instance to override that. When
+you'd rather hold the processor yourself, `predict` is the same call with it passed in first:
+
+```python
+from nobg import Sam3Processor
+
+processor = Sam3Processor.from_pretrained("facebook/sam3")
+model.predict(processor, "input.jpg", "the dog").save("dog.png")
+```
+
+By default the matte comes from SAM3's own prompt-conditioned **semantic** head
+(`config.aggregate="semantic"`). Set `aggregate` to `"max"` or `"mean"` to build it from the
+union of per-object instance masks instead — that path respects `score_threshold` (how many
+detected objects land in the matte, falling back to the best-scoring one so the matte is
+never empty), but produces a noticeably softer alpha:
+
+```python
+model = Sam3.from_origin("facebook/sam3", aggregate="max")
+model.predict(processor, "input.jpg", score_threshold=0.5)
+```
+
+Measured against FeyNobg on two photos, the semantic head is the clear default: MAE
+0.035/0.039 with 19/29 % of pixels at intermediate alpha, versus 0.144/0.150 and 71/79 % for
+the instance union. Reach for `"max"`/`"mean"` when you specifically want the matte to track
+the detected instance set.
+
+The step-by-step form, when you want the instance-level outputs:
+
+```python
+import torch
+from loadimg import load_img
+
+image = load_img("input.jpg").convert("RGB")
+inputs = processor(images=image, text="the dog", return_tensors="pt")
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+alpha = processor.post_process_alpha_matting(
+    outputs, target_sizes=[(image.height, image.width)]
+)[0]
+processor.cutout(image, alpha).save("output.png")
+```
+
+Because the matte is never empty, a prompt for something that *isn't in the image* still
+returns one. Read `presence_logits` to tell the difference — SAM3's presence head is a
+reliable confidence signal (on a cosplay photo: `"the person"` → 0.97, `"the hat"` → 0.85,
+`"the dog"` → 0.001):
+
+```python
+confidence = outputs["presence_logits"].sigmoid().item()
+```
+
+The per-object outputs come through untouched (`pred_masks`, `pred_boxes`, `pred_logits`,
+`presence_logits`, `semantic_seg`), so `processor.image_processor.post_process_instance_segmentation`
+still works for instance-level use.
+
+**Which model to reach for.** SAM3 finds the right subject — on a test photo its matte
+agrees with FeyNobg at IoU 0.98 — but it's a detector, not a matting model: masks are
+predicted at a fraction of the input resolution and upsampled, so edges stay softer
+(19 – 29 % of pixels land at intermediate alpha, versus 3 % for FeyNobg). Use **SAM3 when you
+need to choose *what* to cut out**, and **FeyNobg when you need hair-level edges**.
+
+> [!NOTE]
+> nobg ships **no SAM weights** — `from_origin("facebook/sam3")` downloads them from Meta's
+> gated repo, under Meta's [SAM License](https://huggingface.co/facebook/sam3/blob/main/LICENSE)
+> rather than nobg's Apache-2.0. Accept it on the Hub first. Only the Apache-2.0
+> `transformers` implementation is used in code.
+
+Note that `pixel_values` must be exactly `config.image_size` square — the vision tower's
+rotary embeddings are fixed-size — so always preprocess through `Sam3Processor`.
+
+### Batched inference
+
+`predict` takes a list and returns one result per input, each at its original resolution.
+`batch_size` sets how many go through each forward pass:
+
+```python
+paths = ("a.jpg", "b.jpg", "c.jpg")
+for cut, path in zip(model.predict(processor, list(paths), batch_size=4), paths):
+    cut.save(path.replace(".jpg", ".png"))
+```
+
+Or drive it manually — `post_process_alpha_matting` takes one target size per image, so
+mattes come back at each original resolution:
+
+```python
+images = [load_img(p).convert("RGB") for p in paths]
 inputs = processor(images, return_tensors="pt")
 
 with torch.no_grad():
@@ -143,6 +307,30 @@ for im, alpha, path in zip(images, mattes, ("a.png", "b.png", "c.png")):
 ```
 
 The same pattern handles video: decode to frames, batch them, composite back.
+
+### Refining the foreground
+
+A soft matte leaves the old background mixed into every semi-transparent pixel, so
+compositing the original pixels onto a new background shows a halo of the old one —
+most visible on hair, fur and motion blur. `refine_foreground` estimates the unmixed
+foreground color for those pixels, and `cutout(refine=True)` applies it in place:
+
+```python
+processor.cutout(image, alpha, refine=True).save("output.png")
+```
+
+It is pure torch, so it runs wherever its inputs live — keep the tensors on the GPU
+and the refinement stays there too:
+
+```python
+alpha = processor.post_process_alpha_matting(
+    outputs, target_sizes=[(image.height, image.width)]
+)[0]
+foreground = processor.refine_foreground(pixel_tensor.cuda(), alpha.cuda())
+```
+
+`r` (default `90`) sets how far the estimator reaches for a color to borrow; the cost
+grows about linearly with it.
 
 ### GPU & half precision
 
@@ -234,6 +422,9 @@ generated from the shared template.
 
 - [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) by Peng Zheng et al., the
   architecture and training recipe this library builds on.
+- [SAM 3](https://ai.meta.com/research/publications/sam-3-segment-anything-with-concepts/)
+  by Nicolas Carion et al. (Meta AI), wrapped here through its Apache-2.0 `transformers`
+  implementation — no SAM weights are redistributed.
 - [`transformers`](https://github.com/huggingface/transformers) and
   [`huggingface_hub`](https://github.com/huggingface/huggingface_hub) for the
   backbone, processor base and Hub integration.

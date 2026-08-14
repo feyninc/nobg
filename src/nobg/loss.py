@@ -35,3 +35,87 @@ def birefnet_loss(scaled_preds: list[torch.Tensor], gt: torch.Tensor) -> torch.T
         loss = loss + 0.5 * iou_loss(pred_sig, gt)
         loss = loss + 10 * ssim_loss(pred_sig, gt)
     return loss
+
+
+def sigmoid_focal_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.6,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    """Focal loss (`arXiv:1708.02002`) on raw logits, mean-reduced.
+
+    ``alpha`` weights the positive class; note the default is **0.6**, not
+    RetinaNet's 0.25 — SAM 3's semantic-segmentation head uses a
+    foreground-favouring alpha because a matte's positive class covers a large
+    fraction of the image rather than a handful of anchors.
+    """
+    ce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+    prob = pred.sigmoid()
+    p_t = prob * target + (1 - prob) * (1 - target)
+    loss = ce * (1 - p_t).pow(gamma)
+    if alpha >= 0:
+        loss = loss * (alpha * target + (1 - alpha) * (1 - target))
+    return loss.mean()
+
+
+def dice_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Soft dice loss on raw logits: ``1 - 2|X∩Y| / (|X|+|Y|)``, smoothed by 1.
+
+    Per-sample over flattened spatial dims, then averaged over the batch. This is
+    the mask-overlap term of DETR-family set losses, which SAM 3 inherits.
+    """
+    prob = pred.sigmoid().flatten(1)
+    tgt = target.flatten(1)
+    numerator = 2 * (prob * tgt).sum(-1)
+    denominator = prob.sum(-1) + tgt.sum(-1)
+    return (1 - (numerator + 1) / (denominator + 1)).mean()
+
+
+def sam3_loss(
+    scaled_preds: list[torch.Tensor],
+    gt: torch.Tensor,
+    *,
+    focal_alpha: float = 0.6,
+    focal_gamma: float = 2.0,
+    focal_weight: float = 20.0,
+    dice_weight: float = 30.0,
+) -> torch.Tensor:
+    """SAM 3's semantic-segmentation objective: weighted focal + dice.
+
+    Mirrors the ``SemanticSegCriterion`` of Meta's SAM 3 training code — focal
+    loss on the mask logits plus a dice term, at their published relative
+    weights (20 : 30, with ``focal_alpha=0.6``). It is written here from those
+    formulations, not copied: Meta's implementation is under the SAM License
+    while nobg is Apache-2.0.
+
+    Deliberately **not** part of the original criterion, because nobg's wrapper
+    has no matching output:
+
+    - The Hungarian-matched set losses (box L1/GIoU, ``IABCEMdetr``
+      classification, per-instance mask/dice) need instance-level targets;
+      nobg trains on a single merged matte, so there is nothing to match.
+    - The presence-head BCE needs a per-image "is the concept present" label.
+      Every training pair here has a foreground, so that target is constantly
+      1 and the term carries no gradient signal worth having.
+
+    Signature matches ``birefnet_loss`` — a list of predictions and one ground
+    truth — so it drops into ``Sam3.criterion`` unchanged. ``Sam3`` always
+    passes a single-element list.
+
+    Args:
+        scaled_preds: Raw mask logits, each ``(B, 1, H, W)``. Any that do not
+            match ``gt`` spatially are bilinearly resized to it.
+        gt: ``(B, 1, H, W)`` target in ``[0, 1]``.
+    """
+    loss = torch.tensor(0.0, device=gt.device)
+    for pred in scaled_preds:
+        if pred.shape[2:] != gt.shape[2:]:
+            pred = F.interpolate(
+                pred, size=gt.shape[2:], mode="bilinear", align_corners=False
+            )
+        loss = loss + focal_weight * sigmoid_focal_loss(
+            pred, gt, alpha=focal_alpha, gamma=focal_gamma
+        )
+        loss = loss + dice_weight * dice_loss(pred, gt)
+    return loss

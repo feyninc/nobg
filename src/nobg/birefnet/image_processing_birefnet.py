@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING, Union
 
 import torch
-import torch.nn.functional as F
 from transformers.image_processing_backends import TorchvisionBackend
 from transformers.image_processing_base import BatchFeature
 from transformers.image_utils import (
@@ -14,6 +13,8 @@ from transformers.image_utils import (
 from transformers.processing_utils import ImagesKwargs, Unpack
 from transformers.utils import TensorType
 
+from ..utils import cutout, post_process_alpha_matting, refine_foreground, set_doc
+
 if TYPE_CHECKING:
     from PIL.Image import Image
 
@@ -25,8 +26,9 @@ class BiRefNetImageProcessor(TorchvisionBackend):
     square resize to ``image_size`` (bilinear), scale to ``[0, 1]`` and ImageNet
     normalization. ``preprocess`` optionally takes ``segmentation_maps`` and
     returns binarized ``labels`` for training. ``post_process_alpha_matting``
-    turns raw model logits into alpha mattes, and ``cutout`` composites a matte
-    onto the original image.
+    turns raw model logits into alpha mattes, ``refine_foreground`` estimates
+    unmixed foreground colors, and ``cutout`` composites a matte onto the
+    original image.
     """
 
     resample = PILImageResampling.BILINEAR
@@ -108,40 +110,26 @@ class BiRefNetImageProcessor(TorchvisionBackend):
         Returns:
             A list of ``(H, W)`` tensors with values in ``[0, 1]``.
         """
-        logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-        if target_sizes is not None and len(logits) != len(target_sizes):
-            raise ValueError(
-                f"Got {len(target_sizes)} target sizes for a batch of {len(logits)} images"
-            )
-        # Sigmoid before resizing, matching the eval/benchmark scripts.
-        probs = logits.sigmoid()
-        mattes = []
-        for idx in range(len(probs)):
-            alpha = probs[idx].unsqueeze(0)  # (1, 1, H, W)
-            if target_sizes is not None:
-                alpha = F.interpolate(
-                    alpha, size=target_sizes[idx], mode="bilinear", align_corners=False
-                )
-            mattes.append(alpha[0, 0])
-        return mattes
+        return post_process_alpha_matting(outputs, target_sizes)
 
     @staticmethod
-    def cutout(image: "Image", alpha: Union[torch.Tensor, "Image"]) -> "Image":
-        """Composite an alpha matte onto ``image``, returning an RGBA cutout.
+    @set_doc(refine_foreground.__doc__)
+    def refine_foreground(
+        image: Union[torch.Tensor, "Image"],
+        alpha: Union[torch.Tensor, "Image"],
+        r: int = 90,
+    ) -> Union[torch.Tensor, "Image"]:
+        return refine_foreground(image, alpha, r)
 
-        ``alpha`` may be a ``[0, 1]`` tensor of shape ``(H, W)`` or a PIL image; it
-        is resized to ``image.size`` if needed.
-        """
-        from PIL import Image as PILImage
-
-        if isinstance(alpha, torch.Tensor):
-            arr = (alpha.detach().clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
-            alpha = PILImage.fromarray(arr, mode="L")
-        if alpha.size != image.size:
-            alpha = alpha.resize(image.size, PILImage.Resampling.BILINEAR)
-        cutout = image.convert("RGBA")
-        cutout.putalpha(alpha)
-        return cutout
+    @staticmethod
+    @set_doc(cutout.__doc__)
+    def cutout(
+        image: "Image",
+        alpha: Union[torch.Tensor, "Image"],
+        refine: bool = False,
+        r: int = 90,
+    ) -> "Image":
+        return cutout(image, alpha, refine, r)
 
     def push_to_hub(self, repo_id: str, **kwargs) -> str:
         if "/" not in repo_id:

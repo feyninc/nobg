@@ -13,7 +13,8 @@ from transformers.models.swin.modeling_swin import SwinBackbone
 
 from ..loss import birefnet_loss
 from ..mixin import Revised_Mixin
-from ..utils import model_card_template
+from ..utils import model_card_template, predict
+from .image_processing_birefnet import BiRefNetImageProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -529,6 +530,100 @@ class BiRefNet(
                 "intermediate_logits": scaled_preds[:-1],
             }
         return {"logits": logits, "intermediate_logits": scaled_preds[:-1]}
+
+    def predict(
+        self,
+        processor,
+        image,
+        *,
+        batch_size: int = 1,
+        return_type: str = "cutout",
+        **processor_kwargs,
+    ):
+        """Remove the background from one or more images, end to end.
+
+        Wraps the preprocess → forward → post-process → composite sequence in a
+        single call, running under ``no_grad`` in eval mode on the model's own
+        device and dtype.
+
+        Args:
+            processor: A ``BiRefNetImageProcessor``.
+            image: Anything ``loadimg.load_img`` accepts — a path, URL, base64
+                string, numpy array or PIL image — or a list of them.
+            batch_size: Number of images per forward pass. The default of 1 keeps
+                peak memory flat; raise it for throughput.
+            return_type: ``"cutout"`` for RGBA images, ``"alpha"`` for the raw
+                ``(H, W)`` mattes in ``[0, 1]``.
+            **processor_kwargs: Forwarded to the processor.
+
+        Returns:
+            A single result for a single image, or a list for a list of images.
+            Either RGBA ``PIL.Image``s or ``(H, W)`` matte tensors at each image's
+            original resolution, per ``return_type``.
+
+        Note:
+            BiRefNet takes neither a text prompt nor boxes, so unlike
+            ``Sam3.predict`` this signature stops at ``image``. Passing a third
+            positional argument is a ``TypeError``.
+        """
+        return predict(
+            self,
+            processor,
+            image,
+            forward_keys=("pixel_values",),
+            processor_kwargs=processor_kwargs,
+            batch_size=batch_size,
+            return_type=return_type,
+        )
+
+    def default_processor(self) -> BiRefNetImageProcessor:
+        """Build the processor this model's own config implies.
+
+        BiRefNet's preprocessing is fully determined by ``config.image_size``, so
+        this needs nothing from the Hub. Mirrors ``AutoProcessor``'s fallback for
+        repos without a ``preprocessor_config.json``.
+        """
+        size = {"height": self.config.image_size, "width": self.config.image_size}
+        return BiRefNetImageProcessor(size=size)
+
+    def process(
+        self,
+        image,
+        *,
+        batch_size: int = 1,
+        return_type: str = "cutout",
+        **processor_kwargs,
+    ):
+        """Remove the background from one or more images, without a processor.
+
+        ``predict`` without the ``processor`` argument: it builds the one
+        ``default_processor`` describes and forwards everything else unchanged, so
+        a cutout is a single call on a freshly loaded model.
+
+        Args:
+            image: Anything ``loadimg.load_img`` accepts — a path, URL, base64
+                string, numpy array or PIL image — or a list of them.
+            batch_size: Number of images per forward pass. The default of 1 keeps
+                peak memory flat; raise it for throughput.
+            return_type: ``"cutout"`` for RGBA images, ``"alpha"`` for the raw
+                ``(H, W)`` mattes in ``[0, 1]``.
+            **processor_kwargs: Forwarded to the processor.
+
+        Returns:
+            Exactly what ``predict`` returns for the same inputs.
+
+        Note:
+            Pass a processor to ``predict`` instead when you have one already, or
+            when a checkpoint's ``preprocessor_config.json`` differs from its
+            ``config.image_size`` — this method trusts the model config.
+        """
+        return self.predict(
+            self.default_processor(),
+            image,
+            batch_size=batch_size,
+            return_type=return_type,
+            **processor_kwargs,
+        )
 
     @classmethod
     def from_origin(

@@ -9,9 +9,11 @@ src/nobg/
 ├── __init__.py              # Public API exports (all model classes + AutoModel)
 ├── auto.py                  # AutoModel factory (tag-based dispatch)
 ├── mixin.py                 # Revised_Mixin (extends PyTorchModelHubMixin)
-├── utils.py                 # set_doc decorator + model_card_template()
+├── utils.py                 # set_doc + model_card_template() + the shared
+│                            # cutout() / post_process_alpha_matting() / predict()
 └── <model_name>/
     ├── __init__.py
+    ├── image_processing_<model_name>.py   # Processor (see Image Processors)
     └── modeling_<model_name>.py   # Config dataclass + model class
 tests/
 └── test_<model_name>.py     # One test file per model (one TestClass per model)
@@ -128,6 +130,20 @@ A model may ship an image processor that encapsulates its pre/post-processing.
 
 - File: `src/nobg/<model_name>/image_processing_<model_name>.py`; class
   `<ModelName>ImageProcessor` subclasses `transformers.image_processing_backends.TorchvisionBackend`.
+- Exception, for a model whose inputs are not images alone (e.g. a text prompt): ship a
+  composite `<ModelName>Processor` subclassing the upstream `transformers` processor for that
+  architecture instead, so the tokenizer wiring is inherited rather than reimplemented. It
+  still lives in the same file, is exported from `__init__.py`, and is dispatched by
+  `AutoProcessor`. `Sam3Processor` (subclassing `transformers`' own `Sam3Processor`) is the
+  reference case.
+- Whichever base is used, the processor must expose `post_process_alpha_matting` and
+  `cutout`, delegating to the shared implementations in `utils.py` — the nobg output
+  contract is the same raw `(B, 1, H, W)` logits for every model.
+- The paired **model** exposes `predict(processor, image, ...)` (delegating to `utils.predict`)
+  and the processor-free `process(image, ...)`, which delegates to `predict` with the
+  processor from `default_processor()` — the one the model's own config implies. Anything
+  `default_processor` cannot read off the config (SAM3's tokenizer) is resolved there, not in
+  `process`.
 - Defaults live as **class attributes** (`resample`, `image_mean`, `image_std`, `size`,
   `do_resize`, `do_rescale`, `rescale_factor`, `do_normalize`, ...). This is a deliberate
   exception to the dataclass-config rule: transformers' `preprocessor_config.json`
@@ -151,8 +167,9 @@ A model may ship an image processor that encapsulates its pre/post-processing.
 
 - `torch>=2.0` — core framework
 - `huggingface_hub>=1.22.0` — Hub integration and mixin
-- `transformers[torch]>=5.4` — reusable building blocks (e.g. `SwinBackbone`) and the
-  `TorchvisionBackend` image-processor base (which landed in 5.4)
+- `transformers[torch]>=5.5` — reusable building blocks (e.g. `SwinBackbone`, `Sam3Model`),
+  the `TorchvisionBackend` image-processor base (which landed in 5.4) and `models.sam3`
+  (which landed in 5.5)
 - `torchvision>=0.27.1`
 
 Models may import sub-components from `transformers` but must wrap them behind the nobg config dataclass — the user-facing config is always the nobg `@dataclass`, never a transformers config object directly. When a transformers sub-component requires its own config object (e.g., `GPT2Config`), construct that config object inside `__init__` from `self.config` fields; it must never be stored on `self` or exposed publicly. Example: `gpt2_cfg = GPT2Config(n_embd=self.config.hidden_size, n_layer=self.config.num_layers); self.block = GPT2Block(gpt2_cfg)`.
