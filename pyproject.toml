@@ -22,13 +22,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 dependencies = [
-    "torch>=2.0",
     "huggingface_hub>=1.22.0",
     "transformers[torch]>=5.5",
-    "torchvision>=0.15.0",
     "loadimg>=0.5.0",
     "datasets>=5.0.0",
-    "ty>=0.0.61",
 ]
 
 [dependency-groups]
@@ -36,16 +33,35 @@ dev = [
     "pytest>=9.0",
     "ruff>=0.15",
     "ty>=0.0.61",
+    # the framework itself: left out of `dependencies` so installing nobg does
+    # not pick a torch build for you, and pulled in here for the test suite
+    "torch>=2.0",
+    "torchvision>=0.15.0",
+    # same as the `onnx` extra, so the ONNX round-trip tests run under `uv sync`
+    "onnx>=1.17",
+    "onnxruntime>=1.20",
+    "onnxscript>=0.1",
 ]
 notebooks = [
+    { include-group = "dev" },
     "jupyter>=1.0",
     "ipykernel>=6.0",
     "matplotlib>=3.10",
 ]
 train = [
+    { include-group = "dev" },
     "peft>=0.17",
     "python-dotenv>=1.0",
     "wandb>=0.17",
+]
+
+[project.optional-dependencies]
+# `onnx_save_pretrained` / `onnx_from_pretrained`: onnxscript backs torch's
+# torch.export-based exporter, onnxruntime runs the exported graph.
+onnx = [
+    "onnx>=1.17",
+    "onnxruntime>=1.20",
+    "onnxscript>=0.1",
 ]
 
 [project.urls]

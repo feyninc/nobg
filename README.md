@@ -37,6 +37,7 @@
   - [Fine-tuning on custom data](#fine-tuning-on-custom-data)
   - [Re-parameterizing a checkpoint](#re-parameterizing-a-checkpoint)
   - [Push to HuggingFace Hub](#push-to-huggingface-hub)
+  - [ONNX export](#onnx-export)
 - [Acknowledgement](#acknowledgement)
 - [Citation](#citation)
 - [License](#license)
@@ -58,7 +59,15 @@ uv sync
 
 </details>
 
-Requires Python ≥ 3.10 and `torch` ≥ 2.0. See [`pyproject.toml`](https://github.com/feyninc/nobg/blob/20af1e135d042b74f8a161a82bcd6f7f53ed7c33/pyproject.toml) for the full dependency set.
+Requires Python ≥ 3.10, `torch` ≥ 2.0 and `torchvision` ≥ 0.15. Those two are deliberately
+**not** installed for you — pick the build that matches your hardware (a CPU wheel, a CUDA
+one, ROCm) and install it yourself:
+
+```bash
+uv add torch torchvision
+```
+
+See [`pyproject.toml`](https://github.com/feyninc/nobg/blob/20af1e135d042b74f8a161a82bcd6f7f53ed7c33/pyproject.toml) for the full dependency set.
 
 ## Quick Start
 
@@ -417,6 +426,61 @@ processor.push_to_hub("your-username/model-name")
 
 A bare name is auto-prefixed with your Hub username, and a model card is
 generated from the shared template.
+
+### ONNX export
+
+Every model has an ONNX counterpart of each of those three calls. They need the extra:
+
+```bash
+uv add "nobg[onnx]"
+```
+
+```python
+model.onnx_save_pretrained("onnx-out")          # -> onnx-out/model.onnx + config.json + README.md
+model.onnx_push_to_hub("your-username/model-name-onnx")
+```
+
+Loading gives back an `OnnxModel` — the graph under `onnxruntime`, with the same `process`,
+`predict`, `default_processor` and `config` as the torch model, so it drops into the code
+above unchanged:
+
+```python
+from nobg import BiRefNet
+
+model = BiRefNet.onnx_from_pretrained("your-username/model-name-onnx")
+model.process("input.jpg").save("output.png")
+```
+
+`providers=` picks the execution provider (defaults to everything installed, so an
+`onnxruntime-gpu` build uses the GPU); `session_options=` takes an
+`onnxruntime.SessionOptions`.
+
+Two things differ from the torch model. **Shapes are fixed at export time**, batch size
+included — transformers' Swin windowing reshapes with Python ints, which pins the batch no
+matter what `dynamic_axes` claims, so export at the batch size you'll run at and read it back
+off `model.batch_size`:
+
+```python
+model.onnx_save_pretrained("onnx-out", batch_size=4)
+```
+
+And **only the matte is exported**: the graph returns `logits` alone, without BiRefNet's
+`intermediate_logits` or SAM3's instance heads (`pred_masks`, `presence_logits`, …). Keep the
+torch model for those.
+
+The graph's inputs come from `onnx_dummy_inputs()` — `pixel_values` for BiRefNet, plus
+`input_ids`/`attention_mask` for SAM3, whose text prompt is therefore baked in as *shape* only:
+any prompt `Sam3Processor` produces (it pads to 32 tokens) runs on the same graph. Pass
+`dummy_inputs=` to trace a variant, e.g. a box-promptable SAM3:
+
+```python
+inputs = model.onnx_dummy_inputs()
+inputs["input_boxes"] = torch.zeros(1, 1, 4)  # one box per image — only the shape is traced
+model.onnx_save_pretrained("onnx-out", dummy_inputs=inputs)
+```
+
+Anything else goes to `torch.onnx.export`, `opset_version` included (the default, 19, is the
+floor for BiRefNet's `DeformConv`).
 
 ## Acknowledgement
 

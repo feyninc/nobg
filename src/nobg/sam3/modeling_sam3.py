@@ -555,6 +555,38 @@ class Sam3(
             **processor_kwargs,
         )
 
+    # The TorchScript exporter, not torch.export: SAM3's decoder sizes tensors
+    # from data, which torch.export refuses to guard on
+    # (`GuardOnDataDependentSymNode: Eq(u0*u1, 64)`). Nothing is lost — the
+    # traced graph matches torch to ~5e-7 for any prompt, not just the traced
+    # one. BiRefNet needs the opposite; see `Onnx_Mixin.onnx_dynamo`.
+    onnx_dynamo = False
+
+    def onnx_dummy_inputs(self, batch_size: int = 1) -> dict[str, torch.Tensor]:
+        """Add the tokenized prompt ``forward`` requires to the image input.
+
+        SAM3 will not run without ``input_ids``, so the graph has to be traced
+        with one. Only its shape is baked in, and ``Sam3Processor`` always pads
+        text to 32 tokens, so a synthetic prompt of that length gives a graph
+        every real prompt fits.
+
+        ``input_boxes`` is left out: the visual-prompt path is optional, and
+        including it would make boxes mandatory for every call. Pass
+        ``dummy_inputs=`` explicitly to export that variant instead.
+        """
+        inputs = super().onnx_dummy_inputs(batch_size)
+        length = self.config.text_max_position_embeddings
+        # CLIP's specials are the last two ids of its vocabulary (49406/49407 of
+        # 49408), and its pad id is 0.
+        input_ids = torch.zeros(batch_size, length, dtype=torch.long)
+        input_ids[:, 0] = self.config.text_vocab_size - 2  # <|startoftext|>
+        input_ids[:, 1] = self.config.text_vocab_size - 1  # <|endoftext|>
+        attention_mask = torch.zeros(batch_size, length, dtype=torch.long)
+        attention_mask[:, :2] = 1
+        inputs["input_ids"] = input_ids
+        inputs["attention_mask"] = attention_mask
+        return inputs
+
     @classmethod
     def from_origin(
         cls,
