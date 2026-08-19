@@ -455,6 +455,30 @@ model.process("input.jpg").save("output.png")
 `onnxruntime-gpu` build uses the GPU); `session_options=` takes an
 `onnxruntime.SessionOptions`.
 
+A dedicated `-onnx` repo is one option; `subfolder=` is the other, and it is the convention
+`optimum` and `transformers.js` already look in. All three calls take it:
+
+```python
+model.onnx_save_pretrained("out", subfolder="onnx")     # -> out/onnx/model.onnx + config.json
+model.onnx_push_to_hub("your-username/model-name", subfolder="onnx")
+
+model = BiRefNet.onnx_from_pretrained("your-username/model-name", subfolder="onnx")
+```
+
+The push is scoped with `path_in_repo`, so it writes `onnx/` and nothing else — the
+`model.safetensors` beside it, the processor config and any eval assets are not part of the
+commit. The repo's model card is *patched* in a second, separate commit rather than
+regenerated: it gains the `onnx` tag and a "how to load the ONNX export" section if they
+aren't already there, so re-pushing is idempotent and a hand-written card survives. Pass
+`update_model_card=False` to leave the card alone entirely; `onnx_save_pretrained` takes
+`model_card=` for the same decision locally, its default being "no `README.md` inside a
+subfolder", since the directory it joins already has one.
+
+Loading with `subfolder=` narrows the download to that folder plus the root metadata, so
+pulling a graph out of a torch repo doesn't drag the safetensors along. `config.json` is read
+from the subfolder if it's there and from the repo root otherwise, since that's where the Hub
+convention keeps it.
+
 Two things differ from the torch model. **Shapes are fixed at export time**, batch size
 included — transformers' Swin windowing reshapes with Python ints, which pins the batch no
 matter what `dynamic_axes` claims, so export at the batch size you'll run at and read it back

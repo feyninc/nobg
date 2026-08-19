@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import logging
 import os
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -16,9 +17,20 @@ from torch import nn
 from .utils import predict, set_doc
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from _typeshed import DataclassInstance
 
+logger = logging.getLogger(__name__)
+
 ONNX_FILE_NAME = "model.onnx"
+
+# Where an export goes when it shares a repo with the torch checkpoint. `onnx/`
+# is the convention optimum and transformers.js already look in, so a repo laid
+# out this way is loadable by more than nobg. It is only ever a default for
+# callers to opt into: `subfolder=` defaults to None everywhere, which keeps the
+# root-of-its-own-repo layout byte-for-byte unchanged.
+ONNX_SUBFOLDER = "onnx"
 
 # `DeformConv`, which BiRefNet's deformable convolutions lower to, is an
 # opset-19 operator. A lower opset exports but fails to load in onnxruntime
@@ -27,9 +39,9 @@ DEFAULT_ONNX_OPSET = 19
 
 # Weight formats an ONNX repo never needs, skipped when downloading one.
 # Everything else *is* downloaded: an export whose initializers exceed the 2 GB
-# protobuf limit spills them into sidecar files that only the graph knows the
-# names of (`model.onnx.data` from the torch.export exporter, one file per
-# tensor from the TorchScript one).
+# protobuf limit spills them into a `model.onnx.data` sidecar the graph is
+# unusable without, and an export written by an older nobg (or by another tool)
+# may have spilled into per-tensor sidecars only the graph knows the names of.
 _TORCH_WEIGHT_PATTERNS = [
     "*.safetensors",
     "*.bin",
@@ -42,6 +54,8 @@ _TORCH_WEIGHT_PATTERNS = [
 
 # Appended to the shared model card for an export, since the card's own "how to
 # load" covers the torch checkpoint and `from_pretrained` cannot read a graph.
+# The heading doubles as the marker `_onnx_patch_model_card` looks for, so
+# re-pushing over an already-patched card is a no-op rather than a duplicate.
 _ONNX_USAGE_SECTION = """
 ## how to load the ONNX export
 ```
@@ -49,12 +63,24 @@ pip install nobg[onnx]
 ```
 ```python
 from nobg import {class_name}
-model = {class_name}.onnx_from_pretrained("{repo_id}")
+model = {class_name}.onnx_from_pretrained("{repo_id}"{subfolder_arg})
 cutout = model.process("image.png")
 ```
-This repo holds an ONNX export -- `model.onnx`, plus sidecar data files for a
-large model -- traced at fixed input shapes, including the batch size.
+{provenance}
 """
+
+_ONNX_USAGE_HEADING = "## how to load the ONNX export"
+
+# The closing sentence of the usage section, which cannot be shared: a dedicated
+# export repo holds nothing but the graph, whereas a subfolder sits next to the
+# torch weights in a repo whose card describes those.
+_ONNX_PROVENANCE_ROOT = """This repo holds an ONNX export -- `model.onnx`, plus sidecar data files for a
+large model -- traced at fixed input shapes, including the batch size."""
+
+_ONNX_PROVENANCE_SUBFOLDER = """The `{subfolder}/` folder holds an ONNX export of the weights above --
+`{subfolder}/model.onnx`, plus `model.onnx.data` for a large model -- traced at
+fixed input shapes, including the batch size. The torch checkpoint in the repo
+root is unchanged; load it with `from_pretrained` as usual."""
 
 # onnxruntime reports input types as strings; map the ones nobg models take onto
 # the torch dtype the session expects, so a float64 or int32 tensor coming out of
@@ -68,6 +94,34 @@ _ONNX_TO_TORCH_DTYPE = {
     "tensor(uint8)": torch.uint8,
     "tensor(bool)": torch.bool,
 }
+
+
+def _onnx_usage_section(
+    class_name: str, repo_id: str, subfolder: str | None = None
+) -> str:
+    """Render [`_ONNX_USAGE_SECTION`] for one export.
+
+    Args:
+        class_name: The nobg class the graph was exported from, i.e. the one whose
+            ``onnx_from_pretrained`` reads it back.
+        repo_id: Repo the snippet should load from, or a placeholder when the
+            export is only being written locally.
+        subfolder: Folder the graph sits in within that repo, or ``None`` when it
+            is at the root.
+
+    Returns:
+        The Markdown section, ready to append to a card's text.
+    """
+    return _ONNX_USAGE_SECTION.format(
+        class_name=class_name,
+        repo_id=repo_id,
+        subfolder_arg="" if subfolder is None else f', subfolder="{subfolder}"',
+        provenance=(
+            _ONNX_PROVENANCE_ROOT
+            if subfolder is None
+            else _ONNX_PROVENANCE_SUBFOLDER.format(subfolder=subfolder)
+        ),
+    )
 
 
 def _to_model_placement(
@@ -122,6 +176,17 @@ class Onnx_Mixin:
     - ``onnx_push_to_hub(repo_id)`` — that folder, uploaded.
     - ``onnx_from_pretrained(repo_or_directory)`` — an [`OnnxModel`], the graph
       running under onnxruntime with nobg's ``predict``/``process`` on top.
+
+    All three take a ``subfolder=``, so an export can live inside an existing
+    checkpoint's repo as ``onnx/`` ([`ONNX_SUBFOLDER`], the layout optimum and
+    transformers.js look for) instead of needing a repo of its own. That mode is
+    additive by construction: the upload is scoped to the folder, the repo's card
+    is patched rather than rewritten, and a load pulls the folder plus the root
+    metadata rather than the whole repo.
+
+    A large export's weights are always consolidated into a single
+    ``model.onnx.data`` beside the graph, whichever exporter ran — see
+    [`_onnx_consolidate_external_data`].
 
     The exported graph is the matte alone: the traced wrapper returns
     ``forward(**inputs)["logits"]``, so the auxiliary outputs are pruned. Its
@@ -193,9 +258,11 @@ class Onnx_Mixin:
         *,
         config: dict | DataclassInstance | None = None,
         file_name: str = ONNX_FILE_NAME,
+        subfolder: str | None = None,
         batch_size: int = 1,
         opset_version: int = DEFAULT_ONNX_OPSET,
         dummy_inputs: dict[str, torch.Tensor] | None = None,
+        model_card: bool | None = None,
         model_card_kwargs: dict[str, Any] | None = None,
         **export_kwargs: Any,
     ) -> str:
@@ -203,15 +270,21 @@ class Onnx_Mixin:
 
         The ONNX counterpart of ``save_pretrained``: the same ``config.json`` and
         ``README.md`` (tagged ``onnx``), with ``model.onnx`` in place of
-        ``model.safetensors``. A model whose initializers exceed 2 GB also gets
-        sidecar data files, which are part of the export — keep the directory
-        together.
+        ``model.safetensors``. A model whose initializers exceed the 2 GB protobuf
+        limit also gets a ``model.onnx.data`` beside the graph, which is part of
+        the export — keep the directory together.
 
         Args:
             save_directory: Directory to write to; created if needed.
             config: Config to record, as a dict or dataclass. Defaults to the
                 model's own.
             file_name: Name of the ONNX file.
+            subfolder: Folder within ``save_directory`` to write the export into,
+                created if needed; ``"onnx"`` ([`ONNX_SUBFOLDER`]) is the
+                convention for an export that shares a directory or repo with the
+                torch checkpoint. ``None`` writes straight into
+                ``save_directory``. The subfolder is self-contained — it gets its
+                own ``config.json`` — so it can be uploaded on its own.
             batch_size: Batch size to trace at, and the only one the graph
                 accepts. Ignored when ``dummy_inputs`` is given.
             opset_version: ONNX opset to target. The default is the floor for
@@ -219,16 +292,23 @@ class Onnx_Mixin:
             dummy_inputs: Tracing inputs, overriding ``onnx_dummy_inputs()``.
                 Use this to trace a variant of the graph — a visual-prompt SAM3
                 (adding ``input_boxes``), or images at a non-default size.
+            model_card: Whether to write a ``README.md``. ``None``, the default,
+                writes one unless ``subfolder`` is set: a subfolder export lands
+                in a directory that already describes the checkpoint, and a card
+                nested under ``onnx/`` is not the one the Hub renders anyway.
+                ``True``/``False`` decide outright.
             model_card_kwargs: Extra arguments for the model card template.
             **export_kwargs: Forwarded to ``torch.onnx.export``, so its own
                 switches (``dynamo``, ``dynamic_shapes``, ``external_data``,
                 ``optimize``, ``verify``) remain reachable.
 
         Returns:
-            The path of the written ONNX file.
+            The path of the written ONNX file, inside ``subfolder`` when one was
+            given.
         """
         save_directory = Path(save_directory)
-        save_directory.mkdir(parents=True, exist_ok=True)
+        target = save_directory if not subfolder else save_directory / subfolder
+        target.mkdir(parents=True, exist_ok=True)
 
         inputs = (
             self.onnx_dummy_inputs(batch_size)
@@ -251,7 +331,7 @@ class Onnx_Mixin:
         ):
             export_kwargs["dynamo"] = self.onnx_dynamo
 
-        onnx_path = save_directory / file_name
+        onnx_path = target / file_name
         # Note the flag before building the wrapper: the model is a submodule of
         # it, so `wrapper.eval()` is what puts the model in eval mode, and the
         # original mode is restored below rather than silently dropped.
@@ -272,7 +352,18 @@ class Onnx_Mixin:
             if was_training:
                 self.train()
 
-        self._onnx_write_metadata(save_directory, config, model_card_kwargs)
+        # Before anything else looks at the export: whichever exporter ran may
+        # have spilled the initializers into one sidecar file *per tensor*, which
+        # is not a shape anything downstream should have to deal with.
+        _onnx_consolidate_external_data(onnx_path)
+
+        self._onnx_write_metadata(
+            target,
+            config,
+            model_card_kwargs,
+            model_card=model_card,
+            subfolder=subfolder,
+        )
         return str(onnx_path)
 
     def onnx_push_to_hub(
@@ -289,9 +380,11 @@ class Onnx_Mixin:
         ignore_patterns: list[str] | str | None = None,
         delete_patterns: list[str] | str | None = None,
         file_name: str = ONNX_FILE_NAME,
+        subfolder: str | None = None,
         batch_size: int = 1,
         opset_version: int = DEFAULT_ONNX_OPSET,
         dummy_inputs: dict[str, torch.Tensor] | None = None,
+        update_model_card: bool = True,
         model_card_kwargs: dict[str, Any] | None = None,
         **export_kwargs: Any,
     ) -> str:
@@ -300,9 +393,14 @@ class Onnx_Mixin:
         ``push_to_hub`` for the exported graph: ``repo_id`` is auto-prefixed with
         your username when it has no owner, and the whole export — ONNX file, any
         sidecar data, ``config.json``, ``README.md`` — goes up in one commit.
-        Because the ONNX weights are their own artifact, prefer a separate repo
-        (or at least ``file_name``/``subfolder`` discipline) over mixing them into
-        a torch checkpoint's repo.
+
+        With ``subfolder="onnx"`` the export instead joins an existing checkpoint's
+        repo under that folder, the layout optimum and transformers.js expect.
+        Only that folder is written: the upload is scoped with ``path_in_repo``, so
+        the torch weights, the processor config and everything else in the repo
+        root are left exactly as they are. The repo's own model card is then
+        *patched* in a second commit (see ``update_model_card``) rather than
+        regenerated, because a real checkpoint's card is hand-written.
 
         Args:
             repo_id: Target repo, e.g. ``"nobg/birefnet-onnx"``. Without a ``/``,
@@ -317,15 +415,28 @@ class Onnx_Mixin:
             allow_patterns: Only upload files matching these patterns.
             ignore_patterns: Skip files matching these patterns.
             delete_patterns: Delete matching remote files in the same commit.
+                Scoped to ``subfolder`` when one is given, like the upload itself.
             file_name: Name of the ONNX file.
+            subfolder: Folder within the repo to upload into; ``"onnx"``
+                ([`ONNX_SUBFOLDER`]) for a repo that also holds the torch
+                checkpoint. ``None`` uploads to the repo root, the layout for a
+                dedicated ``-onnx`` repo.
             batch_size: Batch size to trace at. Ignored with ``dummy_inputs``.
             opset_version: ONNX opset to target.
             dummy_inputs: Tracing inputs, overriding ``onnx_dummy_inputs()``.
+            update_model_card: With ``subfolder``, whether to also patch the repo's
+                root card — adding the ``onnx`` tag and the "how to load the ONNX
+                export" section if they are not already there. Idempotent, so
+                re-pushing does not duplicate the section. Ignored without
+                ``subfolder``, where the card is written by the export itself.
             model_card_kwargs: Extra arguments for the model card template.
             **export_kwargs: Forwarded to ``torch.onnx.export``.
 
         Returns:
-            The URL of the resulting commit.
+            The URL of the commit that uploaded the export. A model-card commit,
+            if any, is separate and not reported here — a card that fails to
+            update is logged as a warning, never allowed to fail the push whose
+            weights already landed.
         """
         from huggingface_hub import HfApi
         from huggingface_hub.utils import SoftTemporaryDirectory
@@ -346,16 +457,22 @@ class Onnx_Mixin:
                 saved_path,
                 config=config,
                 file_name=file_name,
+                subfolder=subfolder,
                 batch_size=batch_size,
                 opset_version=opset_version,
                 dummy_inputs=dummy_inputs,
                 model_card_kwargs=model_card_kwargs,
                 **export_kwargs,
             )
-            return api.upload_folder(
+            # Upload the subfolder *as* the subfolder: `folder_path` is what gets
+            # walked and `path_in_repo` is where it lands, so nothing outside
+            # `<subfolder>/` is part of the commit — not even a stale root README
+            # the temporary directory might have picked up.
+            commit = api.upload_folder(
                 repo_id=repo_id,
                 repo_type="model",
-                folder_path=saved_path,
+                folder_path=saved_path if not subfolder else saved_path / subfolder,
+                path_in_repo=subfolder,
                 commit_message=commit_message,
                 revision=branch,
                 create_pr=create_pr,
@@ -364,12 +481,38 @@ class Onnx_Mixin:
                 delete_patterns=delete_patterns,
             )
 
+        if subfolder and update_model_card:
+            # The weights are already up at this point, and they are the expensive
+            # part. A card that cannot be read, patched or pushed is a cosmetic
+            # failure, so it is reported rather than raised.
+            try:
+                self._onnx_patch_model_card(
+                    repo_id,
+                    subfolder=subfolder,
+                    token=token,
+                    branch=branch,
+                    create_pr=create_pr,
+                    model_card_kwargs=model_card_kwargs,
+                )
+            except Exception:
+                logger.warning(
+                    "the ONNX export was uploaded to %s/%s, but its model card "
+                    "could not be updated; add the `onnx` tag and a load snippet "
+                    "by hand, or re-run with update_model_card=False to skip it",
+                    repo_id,
+                    subfolder,
+                    exc_info=True,
+                )
+
+        return commit
+
     @classmethod
     def onnx_from_pretrained(
         cls,
         pretrained_model_name_or_path: str | Path,
         *,
         file_name: str = ONNX_FILE_NAME,
+        subfolder: str | None = None,
         providers: list | None = None,
         provider_options: list[dict] | None = None,
         session_options: Any | None = None,
@@ -391,6 +534,11 @@ class Onnx_Mixin:
             pretrained_model_name_or_path: A Hub repo id, or a local directory
                 holding the export.
             file_name: Name of the ONNX file within it.
+            subfolder: Folder within the repo or directory holding the graph, e.g.
+                ``"onnx"`` ([`ONNX_SUBFOLDER`]) for a checkpoint repo the export
+                was pushed into. Also narrows the download to that folder plus the
+                root metadata, so loading the graph out of a torch repo does not
+                drag the safetensors, the eval assets or anything else along.
             providers: onnxruntime execution providers, highest priority first.
                 Defaults to every provider installed, so a GPU build uses the
                 GPU. Pass ``["CPUExecutionProvider"]`` to pin to CPU.
@@ -409,14 +557,24 @@ class Onnx_Mixin:
         """
         model_id = str(pretrained_model_name_or_path)
         if os.path.isdir(model_id):
-            directory = Path(model_id)
+            root = Path(model_id)
         else:
             from huggingface_hub import snapshot_download
 
-            # Whole snapshot minus torch weights: sidecar data files from a large
-            # export have no predictable names, and the ONNX file is unusable
-            # without them.
-            directory = Path(
+            allow_patterns = None
+            if subfolder:
+                # Two patterns, because `filter_repo_objects` applies
+                # `allow_patterns` first and `ignore_patterns` second: everything
+                # under the subfolder, plus the root JSON the export may defer to
+                # for its config. `fnmatch`'s `*` spans separators, so `*.json`
+                # is not anchored to the root — harmless (metadata is tiny) and
+                # not worth enumerating every possible filename to avoid.
+                allow_patterns = [f"{subfolder}/*", "*.json"]
+            # Whole snapshot minus torch weights: an export whose initializers
+            # exceed 2 GB is unusable without its `model.onnx.data` sidecar, and
+            # a graph exported by the TorchScript path may name its sidecars
+            # after tensors, so nothing but weights can be filtered out by name.
+            root = Path(
                 snapshot_download(
                     model_id,
                     revision=revision,
@@ -424,22 +582,31 @@ class Onnx_Mixin:
                     cache_dir=cache_dir,
                     force_download=force_download,
                     local_files_only=local_files_only,
+                    allow_patterns=allow_patterns,
                     ignore_patterns=_TORCH_WEIGHT_PATTERNS,
                 )
             )
 
+        directory = root if not subfolder else root / subfolder
         onnx_path = directory / file_name
         if not onnx_path.is_file():
             raise FileNotFoundError(
                 f"no {file_name!r} in {directory}; pass `file_name=` if the export "
-                "is named differently, or use from_pretrained for a torch checkpoint"
+                "is named differently, `subfolder=` if it sits in a folder of its "
+                "own (`onnx/` for a repo that also holds torch weights), or use "
+                "from_pretrained for a torch checkpoint"
             )
 
         config = None
-        config_path = directory / "config.json"
-        if config_path.is_file():
-            with open(config_path) as f:
-                config = cls._onnx_decode_config(json.load(f))
+        # Beside the graph first, then the root: `save_pretrained` and the Hub
+        # convention both keep a checkpoint's `config.json` at the repo root, so a
+        # subfolder export dropped into someone else's repo may have none of its
+        # own — and the root one describes the same architecture.
+        for config_path in (directory / "config.json", root / "config.json"):
+            if config_path.is_file():
+                with open(config_path) as f:
+                    config = cls._onnx_decode_config(json.load(f))
+                break
 
         return OnnxModel(
             _inference_session(
@@ -453,19 +620,36 @@ class Onnx_Mixin:
             path=onnx_path,
             # Wherever the graph came from is also the best guess for a tokenizer,
             # which SAM3's `default_processor` needs and no config.json records.
+            # Deliberately the repo/directory *root*, not the subfolder:
+            # `tokenizer.json` lives beside the checkpoint, and `AutoTokenizer`
+            # takes a repo id rather than a path within one.
             tokenizer_source=model_id,
         )
 
     def _onnx_write_metadata(
         self,
-        save_directory: Path,
+        target: Path,
         config: dict | DataclassInstance | None,
         model_card_kwargs: dict[str, Any] | None,
+        *,
+        model_card: bool | None = None,
+        subfolder: str | None = None,
     ) -> None:
         """Write the ``config.json`` and ``README.md`` that accompany the graph.
 
         Mirrors ``save_pretrained``'s handling of both, except that the card is
         tagged ``onnx`` so an exported repo is recognizable as one on the Hub.
+
+        Args:
+            target: The directory the graph was written to — the subfolder itself
+                when there is one, so that folder is self-contained and can be
+                uploaded on its own.
+            config: Config to record. ``None`` falls back to the model's own.
+            model_card_kwargs: Extra arguments for the model card template.
+            model_card: Whether to write a card. ``None`` means "unless this is a
+                subfolder export", whose repo already has one at its root.
+            subfolder: The subfolder the export went into, which only changes the
+                card's wording (the repo holds more than the graph).
         """
         if config is None:
             config = getattr(self, "_hub_mixin_config", None)
@@ -474,11 +658,16 @@ class Onnx_Mixin:
         if config is not None:
             if is_dataclass(config) and not isinstance(config, type):
                 config = asdict(config)
-            (save_directory / "config.json").write_text(
+            (target / "config.json").write_text(
                 json.dumps(config, sort_keys=True, indent=2)
             )
 
-        model_card_path = save_directory / "README.md"
+        if model_card is None:
+            model_card = subfolder is None
+        if not model_card:
+            return
+
+        model_card_path = target / "README.md"
         if not model_card_path.exists():  # do not overwrite if already exists
             model_card_kwargs = model_card_kwargs or {}
             card = self.generate_model_card(**model_card_kwargs)
@@ -491,12 +680,76 @@ class Onnx_Mixin:
             card.text = (
                 card.text.rstrip()
                 + "\n"
-                + _ONNX_USAGE_SECTION.format(
-                    class_name=type(self).__name__,
-                    repo_id=model_card_kwargs.get("repo_id") or "<repo id>",
+                + _onnx_usage_section(
+                    type(self).__name__,
+                    model_card_kwargs.get("repo_id") or "<repo id>",
+                    subfolder,
                 )
             )
             card.save(model_card_path)
+
+    def _onnx_patch_model_card(
+        self,
+        repo_id: str,
+        *,
+        subfolder: str,
+        token: str | None = None,
+        branch: str | None = None,
+        create_pr: bool | None = None,
+        model_card_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        """Add the ``onnx`` tag and load snippet to a repo's existing model card.
+
+        A subfolder export shares a repo with a torch checkpoint, whose card is
+        hand-written and must survive: this reads the live card, edits it in place
+        and pushes it back as its own small commit, rather than regenerating one
+        from the template. Both edits are conditional, so pushing the same export
+        twice leaves the card byte-identical the second time.
+
+        Falls back to generating a card only when the repo has none — a fresh repo
+        the export happened to be the first thing pushed to.
+
+        Args:
+            repo_id: The repo whose root card to patch; already fully qualified.
+            subfolder: Folder the graph was uploaded into, which the snippet has
+                to name for the load to work.
+            token: Hub token; defaults to the cached login.
+            branch: Branch to commit the card on. Defaults to ``main``.
+            create_pr: Open a pull request instead of committing directly.
+            model_card_kwargs: Extra arguments for the model card template, used
+                only on the fallback path.
+        """
+        from huggingface_hub import ModelCard
+        from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError
+
+        try:
+            card = ModelCard.load(repo_id, token=token)
+        # `EntryNotFoundError` — a repo with no README.md at all — does not derive
+        # from `HfHubHTTPError` in huggingface_hub 1.x, so it needs naming.
+        except (EntryNotFoundError, HfHubHTTPError, OSError, ValueError):
+            # No card, or one whose front matter does not parse. Either way there
+            # is nothing to preserve, so fall back to the generated one.
+            logger.info("no usable model card at %s; generating one", repo_id)
+            card = self.generate_model_card(**(model_card_kwargs or {}))
+            card.data = copy.deepcopy(card.data)
+
+        tags = list(card.data.tags or [])
+        if "onnx" not in tags:
+            card.data.tags = [*tags, "onnx"]
+        if _ONNX_USAGE_HEADING not in card.text:
+            card.text = (
+                card.text.rstrip()
+                + "\n"
+                + _onnx_usage_section(type(self).__name__, repo_id, subfolder)
+            )
+        card.push_to_hub(
+            repo_id,
+            token=token,
+            repo_type="model",
+            commit_message="Document the ONNX export using huggingface_hub.",
+            revision=branch,
+            create_pr=create_pr,
+        )
 
     @classmethod
     def _onnx_decode_config(cls, config_dict: dict) -> Any:
@@ -517,6 +770,144 @@ class Onnx_Mixin:
             if is_dataclass(decoded):
                 return decoded
         return SimpleNamespace(**config_dict)
+
+
+def _onnx_consolidate_external_data(onnx_path: str | Path) -> Path | None:
+    """Collapse an export's external-data sidecars into a single ``.data`` file.
+
+    A graph whose initializers exceed the 2 GB protobuf limit cannot hold them
+    inline, and the two torch exporters spill differently: the ``torch.export``
+    path writes one ``model.onnx.data``, but the TorchScript path's C++ serializer
+    (``graph._export_onnx``) writes **one file per tensor**, named after the
+    tensor (``..._attention_Constant_24_attr__value``, or a bare ``16025``).
+    Measured on ``nobg/sam3-prompted`` — 3.36 GB, 840 M parameters — that is 609
+    files: fewer than there are weights, because initializers are deduplicated,
+    but more than there are weights' worth, because graph ``Constant`` attributes
+    spill too. Either way it is a directory nothing wants to upload, download or
+    reason about. This rewrites such an export into the one-file layout, which is
+    also what ``optimum`` and ``onnxruntime`` expect; on that model it takes ~3.5 s
+    and yields a 41 MB graph beside a 3.269 GB data file.
+
+    Deliberately a no-op for the common case: an export that fits inside the
+    protobuf limit has no external data at all, and one that already keeps its
+    data in a single file is left untouched rather than rewritten.
+
+    Args:
+        onnx_path: The exported ``.onnx`` file. Sidecars are resolved relative to
+            its directory, which is where ONNX requires them to live.
+
+    Returns:
+        The path of the single data file the graph now references, or ``None``
+        when there is none — either because nothing was external to begin with
+        (the TorchScript path under the limit), or because merging left every
+        tensor small enough to keep inline.
+
+    Raises:
+        ImportError: If the ``onnx`` extra is not installed.
+    """
+    try:
+        import onnx
+        from onnx.external_data_helper import uses_external_data
+    except ImportError as err:
+        raise ImportError(
+            "onnx is required to finish an ONNX export: pip install nobg[onnx]"
+        ) from err
+
+    onnx_path = Path(onnx_path)
+
+    # First pass: read the graph *without* resolving the sidecars. This is the only
+    # chance to learn which files the export wrote, because `onnx.load`'s default
+    # `load_external_data=True` clears `data_location`/`external_data` on the way
+    # in — a proto loaded that way reports zero external tensors even for a model
+    # with 609 sidecars on disk. The set it builds is also the authoritative delete
+    # list: globbing the directory instead would risk taking the graph, its
+    # `config.json` or a hand-written card with it.
+    proto = onnx.load(onnx_path, load_external_data=False)
+    locations = {
+        entry.value
+        for tensor in _onnx_all_tensors(proto)
+        if uses_external_data(tensor)
+        for entry in tensor.external_data
+        if entry.key == "location"
+    }
+    if not locations:
+        return None
+    if len(locations) == 1:
+        # Already the layout we want. The `torch.export` exporter lands here for
+        # every model, large or small: `torch.onnx.export(..., external_data=True)`
+        # is its default, so it writes a `model.onnx.data` unconditionally.
+        return onnx_path.parent / next(iter(locations))
+
+    data_name = f"{onnx_path.name}.data"
+    # Second pass, this time resolving the sidecars into memory (1.9 s and 3.4 GB
+    # for `nobg/sam3-prompted`, which is why this is not streamed). `onnx.load`
+    # clears `data_location`/`external_data` as it goes, so every tensor —
+    # `Constant` attributes included — is inline again by the time it is re-saved,
+    # and nothing can be left pointing at a file unlinked below.
+    #
+    # `convert_attribute` is left at its default False, so attribute tensors stay
+    # inline rather than becoming external references from a node attribute. This
+    # is the combination measured on the real checkpoint (41 MB graph + 3.269 GB
+    # data, 1.7 s), and inline is where onnxruntime can still constant-fold them.
+    onnx.save_model(
+        onnx.load(onnx_path),
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=data_name,
+    )
+    for location in locations - {data_name}:
+        sidecar = onnx_path.parent / location
+        if sidecar.is_file():
+            sidecar.unlink()
+    logger.info(
+        "consolidated %d ONNX external-data files into %s", len(locations), data_name
+    )
+    # `onnx.save_model` keeps tensors under its `size_threshold` inline, which is
+    # what makes them constant-foldable by onnxruntime — so a graph of nothing but
+    # small tensors ends up with no data file at all.
+    data_path = onnx_path.parent / data_name
+    return data_path if data_path.is_file() else None
+
+
+def _onnx_all_tensors(proto: Any) -> Iterator[Any]:
+    """Yield every ``TensorProto`` reachable from a ``ModelProto``.
+
+    Initializers, ``Constant``-style tensor attributes and everything inside
+    subgraphs and local functions, because the set has to be exhaustive: a tensor
+    missed here is a sidecar file [`_onnx_consolidate_external_data`] would not
+    know about, and so would leave behind. ``onnx`` has exactly this as
+    ``external_data_helper._get_all_tensors``, but only privately; walking the
+    protos with public field access costs less than depending on that, and
+    ``tests/test_mixin.py`` pins the two to the same answer so a divergence in
+    either direction shows up as a failure.
+
+    Args:
+        proto: A loaded ``onnx.ModelProto``.
+
+    Yields:
+        Each ``TensorProto`` in it, in no particular order.
+    """
+
+    def from_nodes(nodes: Any) -> Iterator[Any]:
+        for node in nodes:
+            for attribute in node.attribute:
+                if attribute.HasField("t"):
+                    yield attribute.t
+                yield from attribute.tensors
+                if attribute.HasField("g"):
+                    yield from from_graph(attribute.g)
+                for subgraph in attribute.graphs:
+                    yield from from_graph(subgraph)
+
+    def from_graph(graph: Any) -> Iterator[Any]:
+        yield from graph.initializer
+        yield from from_nodes(graph.node)
+
+    yield from from_graph(proto.graph)
+    # A `FunctionProto` carries nodes but no initializers of its own.
+    for function in proto.functions:
+        yield from from_nodes(function.node)
 
 
 def _inference_session(

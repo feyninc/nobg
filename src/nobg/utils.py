@@ -423,8 +423,10 @@ pip install nobg
 
 use the AutoModel class
 ```python
-from nobg import AutoModel
+from nobg import AutoModel, AutoProcessor
 model = AutoModel.from_pretrained("{{{{ repo_id | default("{default_repo}", true) }}}}")
+processor = AutoProcessor.from_pretrained("{{{{ repo_id | default("{default_repo}", true) }}}}")
+model.predict(processor, image)
 ```
 or you can use the model class directly
 ```python
