@@ -1,0 +1,12 @@
+{
+  "title": "API reference",
+  "pages": [
+    "auto",
+    "birefnet",
+    "sam3",
+    "processors",
+    "losses",
+    "metrics",
+    "onnx"
+  ]
+}

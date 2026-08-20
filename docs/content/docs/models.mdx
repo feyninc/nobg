@@ -1,0 +1,129 @@
+---
+title: Model zoo
+description: The available checkpoints, and which one to reach for.
+icon: Boxes
+---
+
+| Model | Repo | Params | Resolution | Task | Notes |
+| :--- | :--- | :---: | :---: | :--- | :--- |
+| **FeyNobg** | [`feyninc/FeyNobg`](https://huggingface.co/feyninc/FeyNobg) | 0.3 B | 1024 × 1024 | Background removal / matting | Strongest published model, start here |
+| **MultiMatte** | [`feyninc/multimatte`](https://huggingface.co/feyninc/multimatte) | 0.84 B | 1008 × 1008 | Background removal + text-promptable segmentation | The SAM3 architecture, trained for matting. Picks the subject well; edges stay softer than FeyNobg |
+
+Both load with `AutoModel.from_pretrained`. Meta's own [`facebook/sam3`](https://huggingface.co/facebook/sam3)
+is a *conversion source*, not a nobg checkpoint — see [Starting from Meta's weights](#starting-from-metas-weights).
+
+## FeyNobg
+
+A [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) with a Swin backbone, trained for dichotomous
+image segmentation. It is the default: it takes an image and nothing else, and it predicts the matte
+at full input resolution, so soft edges — hair, fur, motion blur — come out as genuinely soft alpha.
+
+```python
+from nobg import AutoModel
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg")
+model.process("input.jpg").save("output.png")
+```
+
+See the [BiRefNet reference](/docs/reference/birefnet) for the config fields and methods.
+
+## MultiMatte
+
+The [SAM 3](https://ai.meta.com/research/publications/sam-3-segment-anything-with-concepts/)
+architecture — a promptable, open-vocabulary detector — trained for matting. `nobg` wraps the
+Apache-2.0 `transformers` implementation and collapses its prompt-conditioned segmentation into a
+single alpha matte, so it drops into the same flow as FeyNobg, and gains the capability BiRefNet does
+not have: choosing *what* to cut out.
+
+```python
+from nobg import AutoModel
+
+model = AutoModel.from_pretrained("feyninc/multimatte")
+model.process("input.jpg", "the dog").save("dog.png")
+```
+
+Prompt-free, it behaves like any other background remover — the config's `default_prompt`
+(`"the main foreground subject"`) is supplied for you:
+
+```python
+model.process("input.jpg").save("output.png")
+```
+
+The class is `Sam3`; `AutoModel` resolves it from the repo's `nobg-sam3` tag. See [Text and box
+prompts](/docs/guides/text-prompts) and the [Sam3 reference](/docs/reference/sam3).
+
+### Starting from Meta's weights
+
+To convert Meta's untrained-for-matting checkpoint yourself instead, `from_origin` reads the upstream
+layout:
+
+```python
+from nobg import Sam3
+
+model = Sam3.from_origin("facebook/sam3")
+```
+
+<Callout type="warn" title="No SAM weights are redistributed">
+  `from_origin("facebook/sam3")` downloads them from Meta's gated repo, under Meta's
+  [SAM License](https://huggingface.co/facebook/sam3/blob/main/LICENSE) rather than nobg's
+  Apache-2.0. Accept it on the Hub first. Only the Apache-2.0 `transformers` implementation is used
+  in code.
+</Callout>
+
+## Which one to reach for
+
+The SAM3 architecture finds the right subject — measured on `facebook/sam3`, its matte agrees with
+FeyNobg at IoU 0.98 on a test photo — but it is a detector at heart: masks are predicted at a fraction
+of the input resolution and upsampled, so edges stay softer. On two test photos, 19–29 % of pixels land
+at intermediate alpha, versus 3 % for FeyNobg.
+
+- **MultiMatte** when you need to choose *what* to cut out, by name or by box.
+- **FeyNobg** when you need hair-level edges.
+
+## Loading a checkpoint
+
+`AutoModel` reads the repo's Hub tags and returns the concrete class; `AutoProcessor` reads
+`preprocessor_config.json` (falling back to the model config) and returns the matching processor:
+
+```python
+from nobg import AutoModel, AutoProcessor
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg")
+processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
+```
+
+Concrete classes work too, if you would rather be explicit:
+
+```python
+from nobg import BiRefNet, BiRefNetImageProcessor, Sam3, Sam3Processor
+
+model = BiRefNet.from_pretrained("feyninc/FeyNobg")
+processor = BiRefNetImageProcessor.from_pretrained("feyninc/FeyNobg")
+
+model = Sam3.from_pretrained("feyninc/multimatte")
+processor = Sam3Processor.from_pretrained("feyninc/multimatte")
+```
+
+<Callout title="MultiMatte ships its own tokenizer">
+  `AutoProcessor` and `Sam3Processor.from_pretrained` read it out of the repo. `model.process(...)` goes
+  through `default_processor()` instead, which has no repo to consult after a `from_pretrained`, so it
+  falls back to `openai/clip-vit-large-patch14` — the same 49408-entry BPE vocabulary, so results match.
+  To use the repo's own copy, pass `tokenizer="feyninc/multimatte"` to `process`, or load with
+  `Sam3.from_origin("feyninc/multimatte")`, which records the source.
+</Callout>
+
+Constructing from scratch (random init) uses the config dataclass:
+
+```python
+from nobg import BiRefNet
+from nobg.birefnet.modeling_birefnet import BiRefNetConfig
+
+model = BiRefNet(BiRefNetConfig(image_size=512, embed_dim=128))
+```
+
+<Callout title="from_pretrained vs from_origin">
+  `from_pretrained` loads a checkpoint whose `config.json` and weight layout are already nobg's.
+  `from_origin` builds a *new* model from an existing one — a raw upstream SAM3 repo, a
+  re-parameterized BiRefNet, a pre-0.2.0 checkpoint — injecting every weight whose key and shape
+  still match. See [Hub round-trips](/docs/guides/hub).
+</Callout>

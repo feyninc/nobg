@@ -1,0 +1,93 @@
+---
+title: Evaluation
+description: Score a model with nobg.metrics — segmentation, boundary and matting metrics in pure torch.
+icon: ChartLine
+---
+
+`nobg.metrics` is the metric suite used to benchmark these models: the BiRefNet set (MAE, S-measure,
+max/mean/weighted F-measure, max/mean E-measure), common overlap metrics (IoU, Dice, accuracy, BER),
+boundary IoU, and the alpha-matting metrics (SAD, MSE, gradient error, connectivity error). Everything
+is pure torch, batched, and runs on whatever device the tensors are on.
+
+## The convention
+
+Every function takes a **probability** map `pred` in `[0, 1]` and a ground truth `gt` in `[0, 1]`,
+both shaped `(B, 1, H, W)`, and returns a scalar tensor averaged over the batch.
+
+<Callout title="Sigmoid first">
+  Models emit **raw logits**. Applying the sigmoid is the caller's job — the same convention as
+  `nobg.loss`. `post_process_alpha_matting` already returns probabilities, so mattes from it are ready
+  to score.
+</Callout>
+
+```python
+import torch
+from nobg import AutoModel, AutoProcessor
+from nobg.metrics import mae, boundary_iou, f_measure_max, s_measure
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg").eval()
+processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
+
+inputs = processor(images=images, segmentation_maps=masks, return_tensors="pt")
+with torch.no_grad():
+    outputs = model(pixel_values=inputs["pixel_values"])
+
+pred = outputs["logits"].sigmoid()   # (B, 1, H, W) in [0, 1]
+gt = inputs["labels"]                # (B, 1, H, W) in {0, 1}
+
+print(f"MAE      {mae(pred, gt):.4f}")
+print(f"S        {s_measure(pred, gt):.4f}")
+print(f"maxF     {f_measure_max(pred, gt):.4f}")
+print(f"BIoU     {boundary_iou(pred, gt):.4f}")
+```
+
+Scoring the *matte* rather than the model's own resolution is the more honest comparison — pass
+`target_sizes` to `post_process_alpha_matting`, then `unsqueeze` to `(B, 1, H, W)`:
+
+```python
+mattes = processor.post_process_alpha_matting(
+    outputs, target_sizes=[(im.height, im.width) for im in images]
+)
+score = mae(mattes[0][None, None], gt_full[None, None])
+```
+
+## What to report
+
+| Question | Metric |
+| :--- | :--- |
+| How wrong is the alpha, on average? | `mae` |
+| How good is the structure? | `s_measure` |
+| Overall detection quality across thresholds | `f_measure_max`, `f_measure_mean`, `weighted_f_measure` |
+| Pixel-level agreement across thresholds | `e_measure_max`, `e_measure_mean` |
+| How good are the **edges**? | `boundary_iou` |
+| Hard-mask overlap at one threshold | `iou_metric`, `dice`, `accuracy`, `ber` |
+| Matting error on soft alpha | `sad`, `mse_metric`, `gradient_error`, `connectivity_error` |
+
+`boundary_iou` (Cheng et al., CVPR 2021 — reported as mBIoU on HQSeg-44K) is the one to add when
+region metrics saturate: it scores only a thin band around the contour, so interior agreement cannot
+hide edge errors.
+
+The matting metrics treat both maps as **continuous alpha** and do not binarize; the segmentation
+metrics binarize `pred` at a threshold. That distinction is the reason both groups exist.
+
+## Cost
+
+Metrics are grouped by cost, and it is worth knowing which loop you are putting them in:
+
+| Tier | Metrics |
+| :--- | :--- |
+| Cheap, `O(N)` | `mae`, `iou_metric`, `dice`, `accuracy`, `ber`, `sad`, `mse_metric`, `boundary_iou` |
+| Medium, `O(N·T)` | `f_measure_max/mean`, `e_measure_max/mean` (histogram based), `gradient_error` |
+| Expensive | `s_measure` (per-image Python loop), `weighted_f_measure`, `connectivity_error` |
+
+`connectivity_error` is by a wide margin the most expensive: its connected components come from
+pure-torch label propagation, which needs `O(longest path)` iterations.
+
+<Callout title="Small deviations from the reference tools">
+  `weighted_f_measure` approximates the official Euclidean distance transform with a fixed Gaussian
+  kernel, and `connectivity_error` derives components by label propagation rather than scipy
+  labelling. Both are consistent run-to-run and fine for ranking, but absolute values differ slightly
+  from the official numpy tools — do not mix them into a published table computed with those.
+</Callout>
+
+See the [metrics reference](/docs/reference/metrics) for every signature.

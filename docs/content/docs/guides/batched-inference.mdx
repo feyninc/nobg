@@ -1,0 +1,74 @@
+---
+title: Batched inference
+description: Many images per call, and the same pattern for video frames.
+icon: Layers
+---
+
+## With `predict` / `process`
+
+Pass a list and get one result per input, each at its original resolution. `batch_size` sets how many
+go through each forward pass:
+
+```python
+paths = ("a.jpg", "b.jpg", "c.jpg")
+for cut, path in zip(model.predict(processor, list(paths), batch_size=4), paths):
+    cut.save(path.replace(".jpg", ".png"))
+```
+
+The default `batch_size=1` keeps peak memory flat, which matters at these resolutions: a 1024 × 1024
+input through a 0.3 B model is not free. Raise it for throughput once you know what fits.
+
+`boxes` for SAM3 are sliced alongside the images, one entry per image, so batching cannot misalign
+them. A single shared text prompt is repeated to the image batch size automatically.
+
+## Manually
+
+`post_process_alpha_matting` takes one target size per image, so mattes come back at each original
+resolution:
+
+```python
+import torch
+from loadimg import load_img
+
+images = [load_img(p).convert("RGB") for p in paths]
+inputs = processor(images, return_tensors="pt")
+
+with torch.no_grad():
+    outputs = model(pixel_values=inputs["pixel_values"])
+
+mattes = processor.post_process_alpha_matting(
+    outputs, target_sizes=[(im.height, im.width) for im in images]
+)
+for im, alpha, path in zip(images, mattes, ("a.png", "b.png", "c.png")):
+    processor.cutout(im, alpha).save(path)
+```
+
+A mismatch between the number of target sizes and the batch size raises rather than silently
+truncating.
+
+## Video
+
+The same pattern handles video: decode to frames, batch them, composite back. Nothing in `nobg` is
+video-specific — frames are just images, and mattes are per-frame.
+
+```python
+frames = [...]  # PIL images, decoded however you like
+
+mattes = model.process(frames, batch_size=8, return_type="alpha")
+for frame, alpha in zip(frames, mattes):
+    ...  # composite onto the new background, then encode
+```
+
+<Callout title="Temporal consistency">
+  Both models are per-frame; nothing propagates state across frames, so flicker in a hard sequence is
+  expected. Compositing the [refined foreground](/docs/guides/refining-edges) rather than the raw
+  pixels helps a lot on motion blur.
+</Callout>
+
+## Memory notes
+
+- Peak memory scales with `batch_size` × `image_size²`. Halving the resolution is the cheaper lever
+  when a batch will not fit.
+- [Half precision](/docs/guides/gpu-and-precision) roughly halves activation memory.
+- With `return_type="alpha"` the results are CPU float32 tensors, so a long list of high-resolution
+  mattes has a real cost of its own — consume them as you go if that matters.

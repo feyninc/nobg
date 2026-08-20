@@ -1,0 +1,125 @@
+---
+title: Hub round-trips
+description: Save, push, load — and re-parameterize a checkpoint into a new architecture.
+icon: CloudUpload
+---
+
+Models inherit `PyTorchModelHubMixin`, so the Hub methods are the ones you already know. Processors
+inherit `transformers`' image-processing base and behave the same way.
+
+## Save and load locally
+
+```python
+model.save_pretrained("my-model")        # model.safetensors + config.json + README.md
+processor.save_pretrained("my-model")    # preprocessor_config.json
+
+model = BiRefNet.from_pretrained("my-model")
+processor = BiRefNetImageProcessor.from_pretrained("my-model")
+```
+
+The config dataclass **is** the serialization schema: `config.json` is its fields, nothing more, and
+`from_pretrained` reconstructs the dataclass from it. There is no custom serialization to keep in
+sync.
+
+## Push to the Hub
+
+```python
+model.push_to_hub("your-username/model-name")
+processor.push_to_hub("your-username/model-name")
+```
+
+A bare name is auto-prefixed with your Hub username — `push_to_hub("my-matting-model")` resolves
+through `whoami()` — and a model card is generated from the shared template, with load instructions
+for both `AutoModel` and the concrete class.
+
+For `AutoModel.from_pretrained` to find the class again, the repo needs the Hub tags the class
+declares (`nobg` plus a model tag such as `nobg-birefnet`). `push_to_hub` writes them into the card's
+front matter for you.
+
+## Re-parameterizing a checkpoint
+
+`from_origin` builds a *new* model from an existing one, injecting every weight whose key and shape
+still match and freshly initializing the rest. It is the tool for changing resolution, growing the
+decoder, or migrating an old checkpoint.
+
+```python
+from nobg import BiRefNet
+
+model = BiRefNet.from_origin("feyninc/FeyNobg", image_size=2048)
+```
+
+<TypeTable
+  type={{
+    origin: {
+      description: 'A Hub repo id, a local directory with config.json + model.safetensors, or a live nn.Module.',
+      type: 'str | PathLike | nn.Module',
+      required: true,
+    },
+    config: {
+      description: "An explicit config, replacing the origin's entirely. Mutually exclusive with field overrides.",
+      type: 'BiRefNetConfig | Sam3Config | None',
+      default: 'None',
+    },
+    token: {
+      description: 'Hub token, for a gated or private origin.',
+      type: 'str | None',
+      default: 'None',
+    },
+    '**overrides': {
+      description: "Individual config fields to change; everything else is inherited from the origin's config.",
+      type: 'Any',
+    },
+  }}
+/>
+
+What happens, in order: the origin's config fields are merged with your overrides (or replaced
+outright by `config`), the new model is constructed, and every origin tensor whose key and shape match
+the new state dict is injected. Anything new or reshaped keeps its fresh initialization, and the
+counts are logged at `INFO`:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO)
+model = BiRefNet.from_origin("feyninc/FeyNobg", embed_dim=256)
+# INFO:nobg.birefnet.modeling_birefnet:from_origin: injected <n>/<total> tensors
+# (<n> shape-mismatched, <n> fresh-initialized)
+```
+
+`BiRefNet.from_origin` also understands the pre-0.2.0 custom-Swin key layout and remaps it, so old
+checkpoints load without manual surgery.
+
+<Callout title="This is also how SAM3 is loaded">
+  `Sam3.from_origin("facebook/sam3")` reads the upstream `transformers` checkpoint — a config in
+  `transformers`' nested form and weights under upstream keys — and produces a nobg `Sam3`. It also
+  records where the weights came from, so `default_processor()` can find a matching tokenizer there.
+  See [Text and box prompts](/docs/guides/text-prompts).
+</Callout>
+
+## Where a processor comes from
+
+Three ways, in increasing order of trust in the checkpoint:
+
+| Call | Reads |
+| :--- | :--- |
+| `model.default_processor()` | The model's own config. No Hub round-trip. What `process` uses. |
+| `AutoProcessor.from_pretrained(repo)` | `preprocessor_config.json`, falling back to the model config plus Hub tags for repos that have none. |
+| `BiRefNetImageProcessor.from_pretrained(repo)` | The same file, through an explicit class. |
+
+`AutoProcessor` dispatches on the `image_processor_type` recorded in `preprocessor_config.json`, and
+accepts upstream SAM3 type names (`Sam3ImageProcessor`, `Sam3ImageProcessorFast`) because nobg's
+`Sam3Processor` is a drop-in superset of them — a raw `facebook/sam3` repo therefore loads.
+
+## Model cards
+
+Cards come from `nobg.utils.model_card_template()`: YAML front matter for Hub metadata, load
+instructions via `AutoModel` and the direct class, an optional citation block, and a contribution
+link. Every model passes one at class-definition time, so pushing never produces an empty card.
+
+Pass extra template variables through `model_card_kwargs=` if you want to extend it.
+
+## ONNX exports
+
+The ONNX side mirrors all three methods — `onnx_save_pretrained`, `onnx_push_to_hub`,
+`onnx_from_pretrained` — including a `subfolder=` that lets a graph live inside an existing
+checkpoint's repo under `onnx/`. See [ONNX export](/docs/guides/onnx).

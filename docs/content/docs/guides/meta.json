@@ -1,0 +1,14 @@
+{
+  "title": "Guides",
+  "pages": [
+    "background-removal",
+    "text-prompts",
+    "batched-inference",
+    "refining-edges",
+    "gpu-and-precision",
+    "fine-tuning",
+    "evaluation",
+    "hub",
+    "onnx"
+  ]
+}

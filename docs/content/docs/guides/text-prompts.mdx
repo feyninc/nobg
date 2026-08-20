@@ -1,0 +1,154 @@
+---
+title: Text and box prompts
+description: Cut out a specific subject with SAM3 — by name, or by pointing at it.
+icon: TextCursorInput
+---
+
+`Sam3` wraps [`transformers`' SAM3](https://huggingface.co/docs/transformers/model_doc/sam3) and
+exposes its prompt-conditioned segmentation as a single alpha matte, so it drops into the same flow
+as BiRefNet — plus the capability BiRefNet does not have.
+
+**MultiMatte** is the trained checkpoint; `AutoModel` resolves the `Sam3` class from its tag.
+
+```python
+from nobg import AutoModel
+
+model = AutoModel.from_pretrained("feyninc/multimatte")
+model.process("input.jpg").save("output.png")
+```
+
+<Callout title="Or start from Meta's weights">
+  `Sam3.from_origin("facebook/sam3")` converts Meta's upstream checkpoint instead. Those weights are
+  gated under Meta's [SAM License](https://huggingface.co/facebook/sam3/blob/main/LICENSE) — accept it
+  on the Hub and log in first. `nobg` ships no SAM weights, and only the Apache-2.0 `transformers`
+  implementation is used in code.
+</Callout>
+
+## Prompting by name
+
+Because SAM3 is open-vocabulary, the second argument names what to cut out:
+
+```python
+model.process("input.jpg", "the dog").save("dog.png")
+```
+
+With no `prompt`, the processor supplies `default_prompt` (`"the main foreground subject"`, taken
+from `config.default_prompt`) — which is what makes prompt-free background removal work. A prompt
+applies to **every image** in the call.
+
+## Prompting by box
+
+The third argument is `boxes`: a visual prompt in the **original image's pixel coordinates**. Use it
+when the thing you want is easier to point at than to name.
+
+```python
+model.process("input.jpg", None, [[120, 80, 460, 720]]).save("cutout.png")
+```
+
+Unlike `prompt`, `boxes` is **per-image**: pass `[[x1, y1, x2, y2], ...]` for one image, or one such
+list per image for a batch. The nesting depth is how the two cases are told apart, and the boxes are
+sliced alongside the images so `batch_size` cannot misalign them.
+
+```python
+images = ["a.jpg", "b.jpg"]
+boxes = [[[10, 10, 200, 300]], [[40, 60, 380, 500], [400, 20, 620, 260]]]
+cuts = model.process(images, "the dog", boxes)
+```
+
+Boxes and a prompt can be combined. With boxes and no prompt, SAM3 segments what the boxes point at.
+
+## The processor
+
+`process` builds its processor from the model config: image size and `default_prompt` come straight
+from it, and the CLIP tokenizer is loaded from whatever repo `from_origin` read the weights from,
+falling back to the ungated `openai/clip-vit-large-patch14` (SAM3's text tower *is* CLIP's). Pass
+`tokenizer=` a repo id, a directory or an instance to override that.
+
+When you would rather hold the processor yourself, `predict` is the same call with it passed in
+first. MultiMatte ships its own `processor_config.json` and tokenizer, so loading from the repo gives
+you exactly what it was trained with:
+
+```python
+from nobg import Sam3Processor
+
+processor = Sam3Processor.from_pretrained("feyninc/multimatte")
+model.predict(processor, "input.jpg", "the dog").save("dog.png")
+```
+
+<Callout title="Always preprocess through Sam3Processor">
+  `pixel_values` must be exactly `config.image_size` square — the vision tower's rotary embeddings
+  are fixed-size buffers built from it — and `input_ids` is required, since SAM3 will not run without
+  a prompt. `forward` raises a clear error for both rather than failing deep inside attention.
+</Callout>
+
+## Which head produces the matte
+
+By default the matte comes from SAM3's own prompt-conditioned **semantic** head
+(`config.aggregate="semantic"`). Set `aggregate` to `"max"` or `"mean"` to build it from the union of
+per-object instance masks instead:
+
+```python
+model = Sam3.from_origin("feyninc/multimatte", aggregate="max")
+model.predict(processor, "input.jpg", score_threshold=0.5)
+```
+
+`from_origin` is what takes config-field overrides; `from_pretrained` passes only the checkpoint's own
+config. On an already-loaded model, `model.config.aggregate = "max"` also works — `forward` reads the
+field on every call.
+
+That path respects `score_threshold` — how many detected objects land in the matte, falling back to
+the best-scoring one so the matte is never empty — but produces a noticeably softer alpha, because a
+query's mask logits are calibrated for *binarizing* at 0.5, not for use as a matte.
+
+Measured against FeyNobg on two photos:
+
+| `aggregate` | MAE | Pixels at intermediate alpha | `score_threshold` |
+| :--- | :---: | :---: | :--- |
+| `"semantic"` (default) | 0.035 / 0.039 | 19 / 29 % | ignored |
+| `"max"` / `"mean"` | 0.144 / 0.150 | 71 / 79 % | respected |
+
+The semantic head is the clear default. Reach for `"max"`/`"mean"` when you specifically want the
+matte to track the detected instance set.
+
+## Detecting an absent concept
+
+Because the matte is never empty, a prompt for something that *isn't in the image* still returns one.
+Read `presence_logits` to tell the difference — SAM3's presence head is a reliable confidence signal.
+On a cosplay photo: `"the person"` → 0.97, `"the hat"` → 0.85, `"the dog"` → 0.001.
+
+```python
+import torch
+from loadimg import load_img
+
+image = load_img("input.jpg").convert("RGB")
+inputs = processor(images=image, text="the dog", return_tensors="pt")
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+confidence = outputs["presence_logits"].sigmoid().item()
+```
+
+## Instance-level outputs
+
+The per-object outputs come through untouched — `pred_masks`, `pred_boxes`, `pred_logits`,
+`presence_logits`, `semantic_seg` — so the open-vocabulary detector is still fully usable alongside
+the matte:
+
+```python
+alpha = processor.post_process_alpha_matting(
+    outputs, target_sizes=[(image.height, image.width)]
+)[0]
+processor.cutout(image, alpha).save("output.png")
+
+instances = processor.image_processor.post_process_instance_segmentation(outputs)
+```
+
+## Trade-offs versus FeyNobg
+
+SAM3 finds the right subject — on a test photo its matte agrees with FeyNobg at IoU 0.98 — but it is
+a detector, not a matting model: masks are predicted at a fraction of the input resolution and
+upsampled, so edges stay softer (19–29 % of pixels at intermediate alpha, versus 3 % for FeyNobg).
+
+Use **SAM3 when you need to choose *what* to cut out**, and **FeyNobg when you need hair-level
+edges**.

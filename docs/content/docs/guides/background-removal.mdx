@@ -1,0 +1,143 @@
+---
+title: Removing a background
+description: The three levels of the API — process, predict, and the raw pipeline.
+icon: Scissors
+---
+
+There are three ways to run a model, and they are the same pipeline at three levels of control.
+
+## `process` — no processor
+
+```python
+from nobg import AutoModel
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg")
+cutout = model.process("input.jpg")
+cutout.save("output.png")
+```
+
+`process` builds the processor the model's own config implies (`model.default_processor()`), then
+delegates to `predict`. For BiRefNet that means the image size comes straight from
+`config.image_size`; for SAM3 it also resolves a CLIP tokenizer, which no `config.json` describes.
+
+## `predict` — your processor
+
+```python
+from nobg import AutoProcessor
+
+processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
+cutout = model.predict(processor, "input.jpg")
+```
+
+The processor is the fixed piece of the call, so it comes first; the inputs that vary follow, in
+decreasing order of how often they are supplied: `predict(processor, image, prompt, boxes)`.
+BiRefNet's signature stops at `image` — it takes neither a prompt nor boxes, and passing a third
+positional argument is a `TypeError`.
+
+Use `predict` over `process` when you already hold a processor, or when a checkpoint's
+`preprocessor_config.json` disagrees with its `config.image_size`: `process` trusts the model config,
+`predict` trusts what you hand it.
+
+### What both accept
+
+<TypeTable
+  type={{
+    image: {
+      description: 'A path, URL, base64 string, numpy array or PIL image — anything loadimg.load_img accepts — or a list of them. A single image returns a single result; a list returns a list.',
+      type: 'ImageInput | list[ImageInput]',
+      required: true,
+    },
+    batch_size: {
+      description: 'Images per forward pass. The default keeps peak memory flat; raise it for throughput.',
+      type: 'int',
+      default: '1',
+    },
+    return_type: {
+      description: '"cutout" for RGBA PIL images, "alpha" for the raw (H, W) mattes in [0, 1].',
+      type: '"cutout" | "alpha"',
+      default: '"cutout"',
+    },
+    '**processor_kwargs': {
+      description: 'Forwarded to the processor.',
+      type: 'Any',
+    },
+  }}
+/>
+
+Both run under `torch.no_grad()` in eval mode, on the model's own device and dtype, and restore
+training mode afterwards if the model was in it. Inputs are moved to match the model, so a CUDA
+half-precision model needs no manual `.to()` on the batch.
+
+<Callout title="Already have a preprocessed batch?">
+  `predict` takes raw images, not a `BatchFeature`. Passing one raises a `TypeError` — call the model
+  directly with `**inputs` instead, as below.
+</Callout>
+
+## The raw pipeline
+
+When you need the intermediates — the matte itself, the auxiliary outputs, control over device
+placement:
+
+```python
+import torch
+from loadimg import load_img
+
+image = load_img("input.jpg").convert("RGB")
+inputs = processor(image, return_tensors="pt")
+
+with torch.no_grad():
+    outputs = model(pixel_values=inputs["pixel_values"])
+
+alpha = processor.post_process_alpha_matting(
+    outputs, target_sizes=[(image.height, image.width)]
+)[0]
+processor.cutout(image, alpha).save("output.png")
+```
+
+Four steps, and each is replaceable:
+
+<Steps>
+
+<Step>
+
+**Preprocess.** `processor(images, return_tensors="pt")` gives `pixel_values` of shape
+`(B, 3, image_size, image_size)`: RGB convert, square bilinear resize, rescale to `[0, 1]`, ImageNet
+normalization.
+
+</Step>
+
+<Step>
+
+**Forward.** The model returns a dict with `logits` of shape `(B, 1, H, W)` — **raw** logits, not
+sigmoided — plus whatever else that model produces (`intermediate_logits` for BiRefNet, the instance
+heads for SAM3).
+
+</Step>
+
+<Step>
+
+**Post-process.** `post_process_alpha_matting` applies the sigmoid, then bilinearly resizes each
+matte to its `target_sizes` entry. Omit `target_sizes` to keep the model's own resolution. The result
+is a list of `(H, W)` tensors in `[0, 1]`, one per image.
+
+</Step>
+
+<Step>
+
+**Composite.** `cutout(image, alpha)` returns an RGBA image, resizing the matte to the image if the
+two disagree. Pass `refine=True` to [remove halo fringing](/docs/guides/refining-edges) first.
+
+</Step>
+
+</Steps>
+
+## Just the matte
+
+If you are compositing yourself — onto a new background, into a video pipeline, as a mask for
+something else — skip the RGBA step:
+
+```python
+alpha = model.process("input.jpg", return_type="alpha")   # (H, W) float tensor in [0, 1]
+```
+
+The returned tensors are on the CPU in float32, at each image's original resolution.
