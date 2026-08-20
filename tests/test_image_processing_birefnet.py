@@ -8,6 +8,47 @@ from PIL import Image
 
 from nobg import AutoProcessor, BiRefNet, BiRefNetImageProcessor
 from nobg.birefnet.modeling_birefnet import BiRefNetConfig
+from nobg.utils import _box_blur
+
+
+def _reference_box_blur(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Box filter written out offset by offset, with replicate padding.
+
+    Deliberately naive and independent of the shipped separable implementation:
+    it clamps indices instead of padding and sums every offset in the window,
+    using OpenCV's anchor (``kernel_size // 2`` before the pixel).
+    """
+    lo = kernel_size // 2
+    hi = kernel_size - 1 - lo
+    height, width = x.shape[-2:]
+    acc = torch.zeros_like(x)
+    for dy in range(-lo, hi + 1):
+        rows = (torch.arange(height) + dy).clamp(0, height - 1)
+        for dx in range(-lo, hi + 1):
+            cols = (torch.arange(width) + dx).clamp(0, width - 1)
+            acc += x[..., rows, :][..., cols]
+    return acc / (kernel_size * kernel_size)
+
+
+def _fringed_image(size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A red disc on green, observed through its own soft-edged matte.
+
+    Returns the mixed image and the matte, so refinement has a known right
+    answer: pure red in the soft band, with the green fully unmixed.
+    """
+    rows, cols = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
+    dist = ((rows - size / 2) ** 2 + (cols - size / 2) ** 2).sqrt()
+    alpha = (1 - (dist - size / 4) / (size / 10)).clamp(0, 1)
+    foreground = torch.zeros(3, size, size)
+    foreground[0] = 1.0
+    background = torch.zeros(3, size, size)
+    background[1] = 1.0
+    return foreground * alpha + background * (1 - alpha), alpha
+
+
+def _to_pil(image: torch.Tensor) -> Image.Image:
+    arr = (image.clamp(0, 1) * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+    return Image.fromarray(arr, mode="RGB")
 
 
 class TestBiRefNetImageProcessor:
@@ -140,6 +181,114 @@ class TestBiRefNetImageProcessor:
         expected = (alpha.clamp(0, 1) * 255).to(torch.uint8)
         assert torch.equal(got.to(torch.uint8), expected)
 
+    def test_cutout_refine_keeps_alpha_and_changes_colors(self, processor):
+        # A soft edge over a green background: refining must leave the matte
+        # untouched while pulling the leaked green out of the RGB channels.
+        image, alpha = _fringed_image(48)
+        plain = processor.cutout(_to_pil(image), alpha)
+        refined = processor.cutout(_to_pil(image), alpha, refine=True)
+        assert refined.mode == "RGBA"
+        assert refined.size == plain.size
+        assert np.array_equal(
+            np.array(refined.getchannel("A")), np.array(plain.getchannel("A"))
+        )
+        band = (alpha > 0.05) & (alpha < 0.95)
+        green_before = np.array(plain.getchannel("G"))[band.numpy()].mean()
+        green_after = np.array(refined.getchannel("G"))[band.numpy()].mean()
+        assert green_after < green_before / 2
+
+    def test_refine_foreground_removes_color_fringe(self, processor):
+        image, alpha = _fringed_image(96)
+        refined = processor.refine_foreground(image, alpha)
+        band = (alpha > 0.05) & (alpha < 0.95)
+        # Green is the background that bled in; red is the true subject color.
+        assert refined[1][band].mean() < image[1][band].mean() / 4
+        assert refined[0][band].mean() > 0.8
+
+    def test_refine_foreground_opaque_matte_is_identity(self, processor):
+        # alpha == 1 everywhere leaves nothing to unmix, so the estimator must
+        # hand back the original colors.
+        image = torch.rand(3, 32, 24)
+        refined = processor.refine_foreground(image, torch.ones(32, 24), r=9)
+        assert torch.allclose(refined, image, atol=1e-4)
+
+    @pytest.mark.parametrize(
+        ("image_shape", "alpha_shape"),
+        [
+            ((3, 20, 16), (20, 16)),
+            ((3, 20, 16), (1, 20, 16)),
+            ((2, 3, 20, 16), (2, 1, 20, 16)),
+            ((2, 3, 20, 16), (1, 20, 16)),
+        ],
+    )
+    def test_refine_foreground_shapes(self, processor, image_shape, alpha_shape):
+        out = processor.refine_foreground(
+            torch.rand(image_shape), torch.rand(alpha_shape), r=5
+        )
+        assert out.shape == image_shape
+
+    def test_refine_foreground_resizes_mismatched_alpha(self, processor):
+        out = processor.refine_foreground(
+            torch.rand(3, 20, 16), torch.rand(40, 32), r=5
+        )
+        assert out.shape == (3, 20, 16)
+
+    def test_refine_foreground_pil_roundtrip(self, processor):
+        image = Image.new("RGB", (24, 18), (200, 30, 40))
+        out = processor.refine_foreground(image, Image.new("L", (24, 18), 128), r=5)
+        assert isinstance(out, Image.Image)
+        assert out.mode == "RGB"
+        assert out.size == (24, 18)
+
+    @pytest.mark.parametrize(
+        "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+    )
+    def test_refine_foreground_preserves_dtype_without_overflow(self, processor, dtype):
+        # Half precision overflows the estimator's divisions unless it computes
+        # in float32, which shows up as non-finite (black) patches.
+        out = processor.refine_foreground(
+            torch.rand(3, 32, 32).to(dtype), torch.rand(32, 32).to(dtype), r=9
+        )
+        assert out.dtype == dtype
+        assert torch.isfinite(out).all()
+
+    def test_refine_foreground_radius_wider_than_image(self, processor):
+        out = processor.refine_foreground(
+            torch.rand(3, 16, 16), torch.rand(16, 16), r=90
+        )
+        assert out.shape == (3, 16, 16)
+        assert torch.isfinite(out).all()
+
+    def test_refine_foreground_rejects_bad_rank(self, processor):
+        with pytest.raises(ValueError):
+            processor.refine_foreground(torch.rand(20, 16), torch.rand(20, 16))
+
+    @pytest.mark.parametrize("kernel_size", [2, 3, 5, 6, 7, 8])
+    def test_box_blur_matches_reference_box_filter(self, kernel_size):
+        # The blur runs as two 1-D pools for speed; this pins it to an explicit
+        # replicate-padded box filter using OpenCV's anchor, which is the
+        # `cv2.blur` this replaces. Compared away from the border, where the
+        # reference's index clamping and the pooling padding must agree exactly.
+        torch.manual_seed(0)
+        x = torch.rand(1, 2, 24, 24)
+        got = _box_blur(x, kernel_size)
+        expected = _reference_box_blur(x, kernel_size)
+        margin = kernel_size + 1
+        assert got.shape == x.shape
+        assert torch.allclose(
+            got[..., margin:-margin, margin:-margin],
+            expected[..., margin:-margin, margin:-margin],
+            atol=1e-6,
+        )
+
+    def test_box_blur_unit_kernel_is_identity(self):
+        x = torch.rand(1, 1, 8, 8)
+        assert torch.equal(_box_blur(x, 1), x)
+
+    def test_box_blur_rejects_zero_kernel(self):
+        with pytest.raises(ValueError):
+            _box_blur(torch.rand(1, 1, 8, 8), 0)
+
     def test_end_to_end_with_small_model(self):
         config = BiRefNetConfig(
             image_size=128,
@@ -161,3 +310,173 @@ class TestBiRefNetImageProcessor:
         assert out["logits"].shape == (1, 1, 128, 128)
         assert out["loss"].ndim == 0
         assert torch.isfinite(out["loss"])
+
+
+class TestBiRefNetPredict:
+    @pytest.fixture
+    def model(self):
+        return BiRefNet(
+            config=BiRefNetConfig(
+                image_size=128,
+                patch_size=4,
+                embed_dim=16,
+                num_layers=4,
+                depths=[1, 1, 1, 1],
+                num_heads=[1, 2, 4, 8],
+                window_size=2,
+                dec_channels_inter=8,
+            )
+        )
+
+    @pytest.fixture
+    def processor(self):
+        return BiRefNetImageProcessor(size={"height": 128, "width": 128})
+
+    def test_single_image_returns_cutout(self, model, processor):
+        image = Image.new("RGB", (60, 40), (10, 20, 30))
+        cut = model.predict(processor, image)
+        assert isinstance(cut, Image.Image)
+        assert cut.mode == "RGBA"
+        # Composited back at the input's own resolution, not the model's.
+        assert cut.size == (60, 40)
+
+    def test_list_returns_list_at_original_sizes(self, model, processor):
+        images = [Image.new("RGB", (60, 40)), Image.new("RGB", (33, 77))]
+        cuts = model.predict(processor, images)
+        assert isinstance(cuts, list)
+        assert [c.size for c in cuts] == [(60, 40), (33, 77)]
+
+    def test_return_type_alpha(self, model, processor):
+        image = Image.new("RGB", (60, 40))
+        alpha = model.predict(processor, image, return_type="alpha")
+        assert isinstance(alpha, torch.Tensor)
+        assert alpha.shape == (40, 60)
+        assert alpha.min() >= 0 and alpha.max() <= 1
+
+    def test_batch_size_does_not_change_results(self, model, processor):
+        images = [Image.new("RGB", (60, 40)), Image.new("RGB", (33, 77))]
+        one = model.predict(processor, images, return_type="alpha", batch_size=1)
+        two = model.predict(processor, images, return_type="alpha", batch_size=2)
+        for a, b in zip(one, two):
+            assert torch.allclose(a, b, atol=1e-5)
+
+    def test_accepts_a_path(self, model, processor, tmp_path):
+        path = tmp_path / "in.png"
+        Image.new("RGB", (60, 40), (1, 2, 3)).save(path)
+        assert model.predict(processor, str(path)).size == (60, 40)
+
+    def test_accepts_a_numpy_array(self, model, processor):
+        arr = np.zeros((40, 60, 3), dtype=np.uint8)
+        assert model.predict(processor, arr).size == (60, 40)
+
+    def test_empty_list_returns_empty_list(self, model, processor):
+        assert model.predict(processor, []) == []
+
+    def test_matches_the_manual_pipeline(self, model, processor):
+        model.eval()
+        image = Image.new("RGB", (60, 40), (90, 100, 110))
+        inputs = processor(images=[image], return_tensors="pt")
+        with torch.no_grad():
+            out = model(pixel_values=inputs["pixel_values"])
+        expected = processor.post_process_alpha_matting(
+            out, target_sizes=[(image.height, image.width)]
+        )[0]
+        got = model.predict(processor, image, return_type="alpha")
+        assert torch.equal(expected, got)
+
+    def test_restores_training_mode(self, model, processor):
+        model.train()
+        model.predict(processor, Image.new("RGB", (60, 40)))
+        assert model.training
+        model.eval()
+        model.predict(processor, Image.new("RGB", (60, 40)))
+        assert not model.training
+
+    def test_rejects_a_preprocessed_batch(self, model, processor):
+        inputs = processor(images=Image.new("RGB", (60, 40)), return_tensors="pt")
+        with pytest.raises(TypeError, match="raw images"):
+            model.predict(processor, inputs)
+
+    def test_rejects_bad_arguments(self, model, processor):
+        image = Image.new("RGB", (60, 40))
+        with pytest.raises(ValueError, match="return_type"):
+            model.predict(processor, image, return_type="rgb")
+        with pytest.raises(ValueError, match="batch_size"):
+            model.predict(processor, image, batch_size=0)
+
+    def test_signature_stops_at_image(self, model, processor):
+        # BiRefNet's processor takes neither text nor boxes, so a third
+        # positional argument is a caller error, not something to swallow.
+        with pytest.raises(TypeError):
+            model.predict(processor, Image.new("RGB", (60, 40)), "the dog")
+
+
+class TestBiRefNetProcess:
+    """`process` is `predict` with the processor built from the model's own config."""
+
+    @pytest.fixture
+    def model(self):
+        return BiRefNet(
+            config=BiRefNetConfig(
+                image_size=128,
+                patch_size=4,
+                embed_dim=16,
+                num_layers=4,
+                depths=[1, 1, 1, 1],
+                num_heads=[1, 2, 4, 8],
+                window_size=2,
+                dec_channels_inter=8,
+            )
+        )
+
+    def test_default_processor_follows_the_config(self, model):
+        proc = model.default_processor()
+        assert isinstance(proc, BiRefNetImageProcessor)
+        assert proc.size["height"] == 128 and proc.size["width"] == 128
+
+    def test_default_processor_tracks_a_changed_image_size(self):
+        model = BiRefNet(config=BiRefNetConfig(image_size=64, window_size=2))
+        assert model.default_processor().size["height"] == 64
+
+    def test_default_processor_is_not_shared(self, model):
+        # Fresh each call, so mutating one never leaks into a later `process`.
+        assert model.default_processor() is not model.default_processor()
+
+    def test_single_image_returns_cutout(self, model):
+        cut = model.process(Image.new("RGB", (60, 40), (10, 20, 30)))
+        assert isinstance(cut, Image.Image)
+        assert cut.mode == "RGBA"
+        assert cut.size == (60, 40)
+
+    def test_accepts_a_path(self, model, tmp_path):
+        path = tmp_path / "in.png"
+        Image.new("RGB", (60, 40), (1, 2, 3)).save(path)
+        assert model.process(str(path)).size == (60, 40)
+
+    def test_list_returns_list_at_original_sizes(self, model):
+        images = [Image.new("RGB", (60, 40)), Image.new("RGB", (33, 77))]
+        cuts = model.process(images, batch_size=2)
+        assert [c.size for c in cuts] == [(60, 40), (33, 77)]
+
+    def test_matches_predict_with_the_same_processor(self, model):
+        image = Image.new("RGB", (60, 40), (90, 100, 110))
+        processor = BiRefNetImageProcessor(size={"height": 128, "width": 128})
+        expected = model.predict(processor, image, return_type="alpha")
+        assert torch.equal(expected, model.process(image, return_type="alpha"))
+
+    def test_processor_kwargs_are_forwarded(self, model):
+        # `size` reaches the processor's __call__, overriding the class default.
+        alpha = model.process(
+            Image.new("RGB", (60, 40)),
+            return_type="alpha",
+            size={"height": 64, "width": 64},
+        )
+        assert alpha.shape == (40, 60)
+
+    def test_rejects_bad_arguments(self, model):
+        with pytest.raises(ValueError, match="return_type"):
+            model.process(Image.new("RGB", (60, 40)), return_type="rgb")
+
+    def test_signature_stops_at_image(self, model):
+        with pytest.raises(TypeError):
+            model.process(Image.new("RGB", (60, 40)), "the dog")

@@ -21,13 +21,16 @@ Cost tiers:
                     boundary_iou (a few pooling ops)
     medium O(N*T) : f_measure_max/mean, e_measure_max/mean (histogram based),
                     gradient_error (two separable convolutions)
-    expensive     : s_measure, weighted_f_measure, connectivity_error
-                    (per-image python loops; ``weighted_f_measure``
-                    approximates the official Euclidean distance transform with
-                    a fixed Gaussian kernel, and ``connectivity_error`` derives
-                    its connected components via pure-torch label propagation
-                    rather than the reference scipy labelling, so absolute
-                    values differ slightly from the official numpy tools).
+    expensive     : s_measure, weighted_f_measure, connectivity_error.
+                    ``s_measure`` runs a per-image python loop;
+                    ``weighted_f_measure`` approximates the official Euclidean
+                    distance transform with a fixed Gaussian kernel; and
+                    ``connectivity_error`` derives its connected components via
+                    pure-torch label propagation rather than the reference scipy
+                    labelling, so absolute values differ slightly from the
+                    official numpy tools. Label propagation needs O(longest
+                    path) iterations, which makes it the most expensive metric
+                    here by a wide margin.
 
 Boundary quality:
     ``boundary_iou`` (Cheng et al., "Boundary IoU", CVPR 2021) is the standard
@@ -231,14 +234,72 @@ def _e_measure_at(pred_bin: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
 def _e_measure_curve(
     pred: torch.Tensor, gt: torch.Tensor, num_thresholds: int = 255
 ) -> torch.Tensor:
-    """Per-threshold E-measure averaged over the batch. Returns ``(num_thresholds,)``."""
-    g = (gt >= 0.5).float()
-    scores = torch.zeros(num_thresholds, device=pred.device)
-    for t in range(num_thresholds):
-        thr = (t + 1) / num_thresholds
-        pred_bin = (pred >= thr).float()
-        scores[t] = _e_measure_at(pred_bin, g).mean()
-    return scores
+    """Per-threshold E-measure averaged over the batch. Returns ``(num_thresholds,)``.
+
+    Closed form, equivalent to calling :func:`_e_measure_at` at every threshold but
+    without the loop. Once ``pred`` is binarized, a pixel's enhanced-alignment value
+    depends only on which of the four ``(fm, gm)`` combinations it falls into, and each
+    combination's value is fixed by the two means. So the sum over pixels is a weighted
+    sum of four constants, with the confusion counts as weights -- and those counts come
+    from one cumulative histogram over the thresholds.
+    """
+    b = pred.shape[0]
+    g = (gt >= 0.5).double().view(b, -1)
+    p = pred.reshape(b, -1)
+    n = p.shape[1]
+    # Built in float64 then cast, so the boundaries match the scalar `(t + 1) / n` the
+    # per-threshold form used; dividing in float32 can land 1 ulp off and reclassify a
+    # pixel sitting exactly on a threshold.
+    thresholds = (
+        torch.arange(1, num_thresholds + 1, device=pred.device, dtype=torch.float64)
+        / num_thresholds
+    ).to(p.dtype)
+
+    # `right=True` puts a pixel in every bin whose threshold it would survive, so exact
+    # ties are kept the way `pred >= thr` keeps them.
+    idx = torch.searchsorted(thresholds.contiguous(), p.contiguous(), right=True)
+    positives = torch.zeros(
+        b, num_thresholds + 1, device=pred.device, dtype=torch.float64
+    )
+    true_positives = torch.zeros_like(positives)
+    for i in range(b):
+        positives[i] = torch.bincount(idx[i], minlength=num_thresholds + 1).double()
+        true_positives[i] = torch.bincount(
+            idx[i], weights=g[i], minlength=num_thresholds + 1
+        )
+    # Suffix sums: bin c means "survives the first c thresholds", so the count at
+    # threshold j is the total of every bin above j.
+    positives = positives.flip(-1).cumsum(-1).flip(-1)[:, 1:]
+    true_positives = true_positives.flip(-1).cumsum(-1).flip(-1)[:, 1:]
+
+    num_fg = g.sum(-1, keepdim=True)
+    false_positives = positives - true_positives
+    false_negatives = num_fg - true_positives
+    true_negatives = n - positives - false_negatives
+
+    fm_mean = positives / n
+    gt_mean = num_fg / n
+
+    def enhanced(fm_val: float, gm_val: float) -> torch.Tensor:
+        align_fm = fm_val - fm_mean
+        align_gt = gm_val - gt_mean
+        align = 2 * align_gt * align_fm / (align_gt**2 + align_fm**2 + EPS)
+        return (align + 1) ** 2 / 4
+
+    total = (
+        true_positives * enhanced(1.0, 1.0)
+        + false_positives * enhanced(1.0, 0.0)
+        + false_negatives * enhanced(0.0, 1.0)
+        + true_negatives * enhanced(0.0, 0.0)
+    )
+    scores = total / (n - 1 + EPS)
+
+    # Degenerate GT: score by pixel agreement directly, as _e_measure_at does.
+    empty = (gt_mean <= EPS).squeeze(-1)
+    full = (gt_mean >= 1 - EPS).squeeze(-1)
+    scores[empty] = 1.0 - fm_mean[empty]
+    scores[full] = fm_mean[full]
+    return scores.mean(dim=0).to(pred.dtype)
 
 
 def e_measure_mean(
@@ -427,21 +488,47 @@ def _connected_components(mask: torch.Tensor, n_iter: int = 256) -> torch.Tensor
     to its flat index, then repeatedly takes the max id over its 4-neighbourhood
     until labels stop changing. Returns an ``(H, W)`` integer label map (0 for
     background). ``n_iter`` bounds the propagation; the eval maps are small.
+
+    Note that the bound really does bind on large maps: an id has to travel the
+    component's longest path, which measures at ~840 iterations for a centred disk at
+    1024x1024 and ~3200 for a noisy mask. Past ``n_iter`` a component can still be split
+    across several labels, which shows up as a slightly overstated connectivity error.
+    Raising the bound fixes it at proportional cost.
     """
-    h, w = mask.shape
-    ids = torch.arange(1, h * w + 1, device=mask.device).view(h, w).float()
-    labels = ids * mask
-    for _ in range(n_iter):
-        padded = F.pad(labels.view(1, 1, h, w), (1, 1, 1, 1), value=0)
-        up = padded[:, :, :-2, 1:-1]
-        down = padded[:, :, 2:, 1:-1]
-        left = padded[:, :, 1:-1, :-2]
-        right = padded[:, :, 1:-1, 2:]
-        neigh = torch.maximum(torch.maximum(up, down), torch.maximum(left, right))
-        new = torch.maximum(labels.view(1, 1, h, w), neigh).view(h, w) * mask
-        if torch.equal(new, labels):
-            break
+    return _connected_components_batch(mask.view(1, *mask.shape), n_iter)[0]
+
+
+def _connected_components_batch(masks: torch.Tensor, n_iter: int = 256) -> torch.Tensor:
+    """Batched :func:`_connected_components` over ``(K, H, W)`` masks.
+
+    Propagating every mask in one tensor costs the same per iteration as the slowest
+    single mask, rather than the sum, and needs one convergence sync instead of K. Since
+    the propagation is idempotent once a mask has converged, masks that settle early are
+    unaffected by the extra iterations the others need -- so this labels each mask
+    exactly as the single-mask form does.
+
+    For the same reason the convergence test only has to run periodically: overshooting a
+    converged mask changes nothing, and the ``n_iter`` ceiling is unchanged, so this just
+    trades a few redundant iterations for far fewer device syncs.
+    """
+    k, h, w = masks.shape
+    # Ids are per-mask (not per-batch-element), matching the single-mask numbering.
+    ids = torch.arange(1, h * w + 1, device=masks.device).view(1, h, w).float()
+    labels = ids * masks
+    # Two 1-D max pools give the max over the plus-shaped 4-neighbourhood *including* the
+    # centre, which is what `maximum(labels, neighbourhood_max)` amounts to. Labels are
+    # non-negative, so the zero padding never wins.
+    check_every = 8
+    view = labels.view(k, 1, h, w)
+    for step in range(n_iter):
+        vertical = F.max_pool2d(view, (3, 1), stride=1, padding=(1, 0))
+        horizontal = F.max_pool2d(view, (1, 3), stride=1, padding=(0, 1))
+        new = torch.maximum(vertical, horizontal).view(k, h, w) * masks
+        converged = (step + 1) % check_every == 0 and torch.equal(new, labels)
         labels = new
+        view = labels.view(k, 1, h, w)
+        if converged:
+            break
     return labels.long()
 
 
@@ -456,27 +543,29 @@ def connectivity_error(
     original masks and their largest-connected-component versions. Uses a
     pure-torch label propagation for connected components (see
     ``_connected_components``), so absolute values differ slightly from the
-    official scipy-based tool. Per-image python loop; averaged over the batch.
+    official scipy-based tool. Averaged over the batch.
     """
     b = pred.shape[0]
-    out = torch.zeros(b, device=pred.device)
-    for i in range(b):
-        p = pred[i, 0].clamp(0, 1)
-        g = gt[i, 0].clamp(0, 1)
+    alpha = torch.cat([pred[:, 0].clamp(0, 1), gt[:, 0].clamp(0, 1)], dim=0)
+    # Both maps of every batch element are labelled in one propagation pass.
+    labels = _connected_components_batch((alpha >= threshold).float())
 
-        def _largest_cc_alpha(alpha: torch.Tensor) -> torch.Tensor:
-            binm = (alpha >= threshold).float()
-            labels = _connected_components(binm)
-            if labels.max() == 0:
-                return torch.zeros_like(alpha)
-            counts = torch.bincount(labels.view(-1))
-            counts[0] = 0  # ignore background label
-            keep = counts.argmax()
-            return alpha * (labels == keep).float()
+    # Offset each mask's labels into its own range, so a single bincount separates them.
+    k, h, w = labels.shape
+    stride = h * w + 1
+    offsets = torch.arange(k, device=labels.device).view(k, 1, 1) * stride
+    flat = (labels + offsets * (labels > 0).long()).view(-1)
+    counts = torch.bincount(flat, minlength=k * stride)[: k * stride].view(k, stride)
+    counts[:, 0] = 0  # ignore background label
+    keep = counts.argmax(dim=1)
 
-        p_cc = _largest_cc_alpha(p)
-        g_cc = _largest_cc_alpha(g)
-        # Connectivity term: alpha lost by dropping non-largest components.
-        conn = ((p - p_cc).abs() - (g - g_cc).abs()).abs()
-        out[i] = conn.sum()
-    return out.mean()
+    largest = alpha * (labels == keep.view(k, 1, 1)).float()
+    # An empty mask has no component to keep, so nothing survives.
+    largest = torch.where(
+        (counts.sum(dim=1) == 0).view(k, 1, 1), torch.zeros_like(alpha), largest
+    )
+
+    # Connectivity term: alpha lost by dropping non-largest components.
+    lost = (alpha - largest).abs()
+    conn = (lost[:b] - lost[b:]).abs()
+    return conn.sum(dim=(1, 2)).mean()

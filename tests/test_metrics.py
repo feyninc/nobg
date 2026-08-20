@@ -1,6 +1,10 @@
 import torch
 
 from nobg.metrics import (
+    _connected_components,
+    _connected_components_batch,
+    _e_measure_at,
+    _e_measure_curve,
     accuracy,
     ber,
     boundary_iou,
@@ -151,3 +155,116 @@ class TestMetrics:
         p[..., 36:100, 36:100] = 1.0  # shifted by 4 px
         assert iou_metric(p, g).item() > 0.7
         assert boundary_iou(p, g).item() < iou_metric(p, g).item()
+
+
+class TestVectorizedEquivalence:
+    """Pin the vectorized forms to the straightforward per-item implementations.
+
+    ``_e_measure_curve`` and ``connectivity_error`` were rewritten from python loops
+    into batched form; these tests keep the reference loops around so a future change
+    to either cannot silently move the numbers.
+    """
+
+    @staticmethod
+    def _ref_e_measure_curve(pred, gt, num_thresholds=255):
+        """E-measure evaluated one threshold at a time."""
+        g = (gt >= 0.5).float()
+        scores = torch.zeros(num_thresholds, device=pred.device)
+        for t in range(num_thresholds):
+            scores[t] = _e_measure_at(
+                (pred >= (t + 1) / num_thresholds).float(), g
+            ).mean()
+        return scores
+
+    @staticmethod
+    def _ref_connectivity_error(pred, gt, threshold=0.5):
+        """Connectivity error labelling one map at a time."""
+        b = pred.shape[0]
+        out = torch.zeros(b, device=pred.device)
+        for i in range(b):
+            p = pred[i, 0].clamp(0, 1)
+            g = gt[i, 0].clamp(0, 1)
+
+            def largest_cc_alpha(alpha):
+                labels = _connected_components((alpha >= threshold).float())
+                if labels.max() == 0:
+                    return torch.zeros_like(alpha)
+                counts = torch.bincount(labels.view(-1))
+                counts[0] = 0
+                return alpha * (labels == counts.argmax()).float()
+
+            lost_p = (p - largest_cc_alpha(p)).abs()
+            lost_g = (g - largest_cc_alpha(g)).abs()
+            out[i] = (lost_p - lost_g).abs().sum()
+        return out.mean()
+
+    @staticmethod
+    def _cases(size=48):
+        """(name, pred, gt) covering blobs, degenerate masks and exact ties."""
+        torch.manual_seed(0)
+        yy, xx = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
+        disk = (((yy - size / 2) ** 2 + (xx - size / 2) ** 2) < (size / 3) ** 2).float()
+        blobs = torch.zeros(size, size)
+        for cy, cx, r in [
+            (size // 5, size // 5, size // 10),
+            (4 * size // 5, 4 * size // 5, size // 6),
+        ]:
+            blobs += (((yy - cy) ** 2 + (xx - cx) ** 2) < r**2).float()
+        blobs = blobs.clamp(0, 1)
+
+        def batched(t, n):
+            return t.expand(n, 1, size, size).contiguous()
+
+        return [
+            (
+                "disk+noise",
+                (disk + torch.randn(3, 1, size, size) * 0.2).clamp(0, 1),
+                batched(disk, 3),
+            ),
+            (
+                "random",
+                torch.rand(3, 1, size, size),
+                (torch.rand(3, 1, size, size) > 0.6).float(),
+            ),
+            # Exact 0/1 predictions land on thresholds exactly, catching off-by-one
+            # boundary handling in the histogram form.
+            ("exact", batched(disk, 2), batched(disk, 2)),
+            ("multi-blob", batched(blobs, 2), batched(disk, 2)),
+            ("empty-gt", torch.rand(2, 1, size, size), torch.zeros(2, 1, size, size)),
+            ("full-gt", torch.rand(2, 1, size, size), torch.ones(2, 1, size, size)),
+            ("empty-pred", torch.zeros(2, 1, size, size), batched(disk, 2)),
+            ("constant-pred", torch.full((2, 1, size, size), 0.3), batched(disk, 2)),
+            (
+                "batch-1",
+                disk.view(1, 1, size, size).clone(),
+                blobs.view(1, 1, size, size).clone(),
+            ),
+        ]
+
+    def test_e_measure_curve_matches_per_threshold_loop(self):
+        for name, p, g in self._cases():
+            ref = self._ref_e_measure_curve(p, g)
+            got = _e_measure_curve(p, g)
+            # Tolerance, not equality: the closed form accumulates in float64 and so is
+            # the more accurate of the two.
+            assert torch.allclose(ref, got, atol=1e-5), name
+
+    def test_connectivity_error_matches_per_image_loop(self):
+        for name, p, g in self._cases():
+            ref = self._ref_connectivity_error(p, g)
+            got = connectivity_error(p, g)
+            assert torch.allclose(ref, got, rtol=1e-5, atol=1e-4), name
+
+    def test_batched_labelling_matches_single_mask(self):
+        torch.manual_seed(0)
+        masks = torch.stack(
+            [
+                (torch.rand(24, 24) > 0.4).float(),
+                torch.zeros(24, 24),
+                torch.ones(24, 24),
+                _mask("left", 24)[0, 0],
+            ]
+        )
+        batched = _connected_components_batch(masks)
+        for i, mask in enumerate(masks):
+            assert torch.equal(batched[i], _connected_components(mask)), i

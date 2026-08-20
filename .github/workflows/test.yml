@@ -1,0 +1,21 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      # torch, torchvision and the onnx extras live in the dev group, so the
+      # suite needs it — `dependencies` alone cannot run the tests.
+      - run: uv sync --group dev
+      - run: uv run pytest tests/ -q

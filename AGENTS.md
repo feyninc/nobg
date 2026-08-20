@@ -8,13 +8,17 @@ This document defines the architectural invariants that all future models and co
 src/nobg/
 ├── __init__.py              # Public API exports (all model classes + AutoModel)
 ├── auto.py                  # AutoModel factory (tag-based dispatch)
-├── mixin.py                 # Revised_Mixin (extends PyTorchModelHubMixin)
-├── utils.py                 # set_doc decorator + model_card_template()
+├── mixin.py                 # Revised_Mixin (PyTorchModelHubMixin + Onnx_Mixin)
+│                            # + Onnx_Mixin / OnnxModel (see ONNX Export)
+├── utils.py                 # set_doc + model_card_template() + the shared
+│                            # cutout() / post_process_alpha_matting() / predict()
 └── <model_name>/
     ├── __init__.py
+    ├── image_processing_<model_name>.py   # Processor (see Image Processors)
     └── modeling_<model_name>.py   # Config dataclass + model class
 tests/
-└── test_<model_name>.py     # One test file per model (one TestClass per model)
+├── test_<model_name>.py     # One test file per model (one TestClass per model)
+└── test_mixin.py            # Shared mixin behaviour (the ONNX round trip)
 ```
 
 Each model lives in its own subdirectory under `src/nobg/`. The module must be named `modeling_<name>.py`.
@@ -61,12 +65,14 @@ Constructor contract:
 ```
 nn.Module + Revised_Mixin → ConcreteModel
                 ↑
-    PyTorchModelHubMixin (huggingface_hub)
+    PyTorchModelHubMixin (huggingface_hub) + Onnx_Mixin
 ```
 
 - `Revised_Mixin` provides `push_to_hub()` with auto-prefixed `repo_id` and model card injection.
 - Do **not** override `save_pretrained` or `from_pretrained` — these are handled by the Hub mixin.
-- Do **not** introduce new base classes between `Revised_Mixin` and concrete models.
+- Do **not** introduce new base classes between `Revised_Mixin` and concrete models. Shared
+  behaviour goes into a mixin that `Revised_Mixin` itself inherits (as `Onnx_Mixin` does), so
+  every model picks it up without changing its own bases.
 
 ## Model Card Template
 
@@ -103,6 +109,10 @@ Every model class must be exported from `src/nobg/__init__.py`. Users must be ab
 from nobg import MyModel, AutoModel
 ```
 
+The processors and `OnnxModel` (the runtime wrapper `onnx_from_pretrained` returns) are
+exported the same way. A model class is never imported from its `modeling_<name>` module in
+user-facing docs; only its config dataclass is.
+
 ## Tests
 
 Each model gets its own test file: `tests/test_<model_name>.py`, containing one `class Test<ModelName>`.
@@ -128,6 +138,20 @@ A model may ship an image processor that encapsulates its pre/post-processing.
 
 - File: `src/nobg/<model_name>/image_processing_<model_name>.py`; class
   `<ModelName>ImageProcessor` subclasses `transformers.image_processing_backends.TorchvisionBackend`.
+- Exception, for a model whose inputs are not images alone (e.g. a text prompt): ship a
+  composite `<ModelName>Processor` subclassing the upstream `transformers` processor for that
+  architecture instead, so the tokenizer wiring is inherited rather than reimplemented. It
+  still lives in the same file, is exported from `__init__.py`, and is dispatched by
+  `AutoProcessor`. `Sam3Processor` (subclassing `transformers`' own `Sam3Processor`) is the
+  reference case.
+- Whichever base is used, the processor must expose `post_process_alpha_matting` and
+  `cutout`, delegating to the shared implementations in `utils.py` — the nobg output
+  contract is the same raw `(B, 1, H, W)` logits for every model.
+- The paired **model** exposes `predict(processor, image, ...)` (delegating to `utils.predict`)
+  and the processor-free `process(image, ...)`, which delegates to `predict` with the
+  processor from `default_processor()` — the one the model's own config implies. Anything
+  `default_processor` cannot read off the config (SAM3's tokenizer) is resolved there, not in
+  `process`.
 - Defaults live as **class attributes** (`resample`, `image_mean`, `image_std`, `size`,
   `do_resize`, `do_rescale`, `rescale_factor`, `do_normalize`, ...). This is a deliberate
   exception to the dataclass-config rule: transformers' `preprocessor_config.json`
@@ -140,20 +164,71 @@ A model may ship an image processor that encapsulates its pre/post-processing.
   local-only (`tmp_path`, no network — `AutoProcessor.from_pretrained` needs `model_info`, so
   leave it untested like `AutoModel`).
 
+## ONNX Export
+
+`Onnx_Mixin` (in `mixin.py`, inherited through `Revised_Mixin`) gives every model
+`onnx_save_pretrained` / `onnx_push_to_hub` / `onnx_from_pretrained`, mirroring the Hub
+mixin's three methods. The export is the alpha matte alone — a wrapper traces
+`forward(**inputs)["logits"]` — and its input shapes, batch size included, are fixed at
+export time.
+
+A new model does **not** implement these methods. It overrides at most two hooks:
+
+- `onnx_dummy_inputs(batch_size)` — only if `forward` needs more than `pixel_values`. Extend
+  the `super()` dict rather than rebuilding it; the keys become the graph's input names and
+  their order is `forward`'s. Every entry must be a tensor `forward` accepts, since the graph
+  requires all of them at inference — leave optional inputs out (see `Sam3`, which adds the
+  tokenized prompt but not `input_boxes`).
+- `onnx_dynamo` — only if the default exporter fails on the model. `True` (the default) is
+  the `torch.export` path, which BiRefNet requires because torchvision no longer registers an
+  ONNX symbolic for `deform_conv2d`; `False` is the TorchScript tracer, which SAM3 requires
+  because its decoder sizes tensors from data. Record *which error* forced the override in a
+  comment, as both models do.
+
+Rules:
+
+- Do **not** override `onnx_save_pretrained`/`onnx_push_to_hub`/`onnx_from_pretrained`, and do
+  not add a second export path in a model module.
+- `onnx`/`onnxruntime`/`onnxscript` are an **optional extra** (`nobg[onnx]`), so they must only
+  ever be imported lazily, inside the function that needs them, with an ImportError message
+  naming the extra. `mixin.py` imports none of them at module level.
+- The runtime wrapper is `OnnxModel`, not an `nn.Module`. It reimplements nothing: `predict`
+  delegates to `utils.predict` (with `forward_keys=self.input_names`) and `default_processor`
+  to the torch class's own method, with the wrapper standing in for the model. Anything a new
+  model adds to the torch `predict`/`process` contract must keep working there.
+- Tests live in `tests/test_mixin.py` (one class per model beyond the shared `TestOnnxMixin`),
+  are local-only, and must include a torch-vs-onnxruntime parity assertion on `logits`.
+  Guard the module with `pytest.importorskip` for both `onnxruntime` and `onnxscript`, and
+  export once per module via a `tmp_path_factory` fixture — tracing is slow.
+
 ## Linting and Type Checking
 
 - **Formatter/linter**: `ruff` (check + format)
 - **Type checker**: `ty`
-- Both run in CI on push/PR to `main`
+- **Tests**: `pytest`, run in CI against the dev group (`uv sync --group dev`, since torch
+  lives there)
+- All three run in CI on push/PR to `main`
 - Python 3.13+ type syntax is expected (e.g., `list[str]`, `dict[str, Any]`, `tuple[...]`); for config dataclass fields, follow the stricter type rules in the Configuration section.
 
 ## Dependencies
 
-- `torch>=2.0` — core framework
+Installed with the package (`[project] dependencies`):
+
 - `huggingface_hub>=1.22.0` — Hub integration and mixin
-- `transformers[torch]>=5.4` — reusable building blocks (e.g. `SwinBackbone`) and the
-  `TorchvisionBackend` image-processor base (which landed in 5.4)
-- `torchvision>=0.27.1`
+- `transformers[torch]>=5.5` — reusable building blocks (e.g. `SwinBackbone`, `Sam3Model`),
+  the `TorchvisionBackend` image-processor base (which landed in 5.4) and `models.sam3`
+  (which landed in 5.5)
+
+The framework itself (`torch>=2.0`, `torchvision>=0.15.0`) is **not** declared there: it is a
+dev-group dependency, so an install picks up whatever build is already in the environment
+instead of resolving one. Code may still import torch and torchvision at module level — they
+are hard requirements at runtime, just environment-provided ones. Anything that runs the
+library (`uv run pytest`, CI) must therefore sync the dev group.
+
+Optional extras (never imported at module level — see ONNX Export):
+
+- `nobg[onnx]` — `onnx`, `onnxruntime`, `onnxscript` for the export and its runtime. Mirrored
+  in the `dev` dependency group so the round-trip tests run under `uv sync`.
 
 Models may import sub-components from `transformers` but must wrap them behind the nobg config dataclass — the user-facing config is always the nobg `@dataclass`, never a transformers config object directly. When a transformers sub-component requires its own config object (e.g., `GPT2Config`), construct that config object inside `__init__` from `self.config` fields; it must never be stored on `self` or exposed publicly. Example: `gpt2_cfg = GPT2Config(n_embd=self.config.hidden_size, n_layer=self.config.num_layers); self.block = GPT2Block(gpt2_cfg)`.
 
@@ -163,5 +238,6 @@ Models may import sub-components from `transformers` but must wrap them behind t
 - Do not use JSON/YAML/TOML files for config definition — the dataclass IS the schema.
 - Do not add CLI entry points — this is a library-only package.
 - Do not introduce plugin/entry-point discovery — models are registered manually.
-- Do not override `save_pretrained` or `from_pretrained`.
+- Do not override `save_pretrained` or `from_pretrained`, or their `onnx_*` counterparts.
+- Do not import an optional extra (`onnx`, `onnxruntime`, `onnxscript`) at module level.
 - Do not skip the `model_card_template()` utility.
