@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "huggingface_hub>=1.22.0",
-    "transformers[torch]>=5.5",
+    "transformers>=5.5",
     "loadimg>=0.5.0",
     "datasets>=5.0.0",
 ]
