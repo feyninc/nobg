@@ -1,8 +1,10 @@
 <div align="center">
 
 # nobg
+<img src="https://raw.githubusercontent.com/feyninc/nobg/main/assets/nobg-logo.png" alt="nobg" width="180">
 
-**Open-source background removal & image matting, with first-class HuggingFace Hub integration.**
+
+**Open-source background removal & image matting**
 
 [![PyPI](https://img.shields.io/pypi/v/nobg?color=blue&label=PyPI)](https://pypi.org/project/nobg/)
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/nobg?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/nobg)
@@ -18,7 +20,7 @@
 
 | Input | Output |
 |:-----:|:------:|
-| <img src="assets/feyn_mark.png" width="320"> | <img src="assets/feyn_mark_cutout.png" width="320"> |
+| <img src="https://raw.githubusercontent.com/feyninc/nobg/main/assets/feyn_mark.png" width="320"> | <img src="https://raw.githubusercontent.com/feyninc/nobg/main/assets/feyn_mark_cutout.png" width="320"> |
 
 </div>
 
@@ -67,7 +69,7 @@ one, ROCm) and install it yourself:
 uv add torch torchvision
 ```
 
-See [`pyproject.toml`](https://github.com/feyninc/nobg/blob/20af1e135d042b74f8a161a82bcd6f7f53ed7c33/pyproject.toml) for the full dependency set.
+See [`pyproject.toml`](https://github.com/feyninc/nobg/blob/main/pyproject.toml) for the full dependency set.
 
 ## Quick Start
 

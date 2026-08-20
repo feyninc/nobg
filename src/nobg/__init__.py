@@ -7,4 +7,4 @@ from .mixin import OnnxModel
 from .sam3.image_processing_sam3 import Sam3Processor
 from .sam3.modeling_sam3 import Sam3
 
-__version__ = "0.2.5"
+__version__ = "0.3.0"
