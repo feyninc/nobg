@@ -1,0 +1,108 @@
+---
+title: Installation
+description: Install nobg, pick a torch build, and add the optional extras.
+icon: Download
+---
+
+## Install the package
+
+<Tabs items={['uv', 'pip']}>
+  <Tab value="uv">
+
+```bash
+uv add nobg
+```
+
+  </Tab>
+  <Tab value="pip">
+
+```bash
+pip install nobg
+```
+
+  </Tab>
+</Tabs>
+
+## Install torch yourself
+
+`nobg` requires Python ≥ 3.10, `torch` ≥ 2.0 and `torchvision` ≥ 0.15 — and deliberately does
+**not** declare the last two as dependencies. Installing the package would otherwise resolve a torch
+build for you, which is the one choice that has to match your hardware (CPU wheel, CUDA, ROCm).
+
+<Tabs items={['uv', 'pip']}>
+  <Tab value="uv">
+
+```bash
+uv add torch torchvision
+```
+
+  </Tab>
+  <Tab value="pip">
+
+```bash
+pip install torch torchvision
+```
+
+  </Tab>
+</Tabs>
+
+<Callout title="Picking a build">
+  Follow [pytorch.org](https://pytorch.org/get-started/locally/) for the index URL that matches your
+  accelerator. `nobg` imports whatever is already in the environment.
+</Callout>
+
+Installed alongside the package: `huggingface_hub` (Hub integration and the model mixin),
+`transformers` (reusable building blocks such as `SwinBackbone` and `Sam3Model`, the
+`TorchvisionBackend` image-processor base), `loadimg` (the input loader) and `datasets`.
+
+## Optional extras
+
+The ONNX export and its runtime are an extra, and are imported lazily — nothing in `nobg` touches
+`onnx`, `onnxruntime` or `onnxscript` at import time:
+
+<Tabs items={['uv', 'pip']}>
+  <Tab value="uv">
+
+```bash
+uv add "nobg[onnx]"
+```
+
+  </Tab>
+  <Tab value="pip">
+
+```bash
+pip install "nobg[onnx]"
+```
+
+  </Tab>
+</Tabs>
+
+For GPU inference on an exported graph, install `onnxruntime-gpu` instead of `onnxruntime`; the
+loader defaults to every provider installed. See [ONNX export](/docs/guides/onnx).
+
+## From source
+
+```bash
+git clone https://github.com/feyninc/nobg.git
+cd nobg
+uv sync
+```
+
+`uv sync` installs the `dev` dependency group, which is where `torch`, `torchvision` and the ONNX
+extras live for the test suite — the package's own `dependencies` alone cannot run the tests. See
+[Contributing](/docs/contributing).
+
+## Gated weights
+
+`nobg` ships no model weights of its own; they come from the Hub on first load.
+[FeyNobg](https://huggingface.co/feyninc/FeyNobg) and
+[MultiMatte](https://huggingface.co/feyninc/multimatte) are nobg's own checkpoints.
+
+Meta's upstream [`facebook/sam3`](https://huggingface.co/facebook/sam3) is gated — only needed if you
+convert it yourself with `Sam3.from_origin`. Accept the
+[SAM License](https://huggingface.co/facebook/sam3/blob/main/LICENSE) on the Hub, then log in so the
+download is authorized.
+
+```bash
+hf auth login
+```

@@ -1,0 +1,169 @@
+---
+title: Fine-tuning
+description: Train on your own image/mask pairs with the HuggingFace Trainer.
+icon: GraduationCap
+---
+
+`nobg` provides the model, the processor and the loss; because the models plug into the HuggingFace
+`Trainer`, you get its training loop, checkpointing and evaluation for free.
+
+The contract is small:
+
+- the processor turns `segmentation_maps` into binarized `labels` of shape `(B, 1, H, W)`
+- `forward(pixel_values, labels=...)` returns `loss` alongside `logits`
+- `model.criterion` is the function that computes it, and it is swappable
+
+## BiRefNet
+
+```python
+from nobg import AutoModel, AutoProcessor
+from transformers import Trainer, TrainingArguments
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg")
+processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
+
+
+def collate(examples):
+    batch = processor(
+        images=[example["image"] for example in examples],
+        segmentation_maps=[
+            example["mask"].convert("L") for example in examples
+        ],
+        return_tensors="pt",
+    )
+    return {
+        "pixel_values": batch["pixel_values"],
+        "labels": batch["labels"],
+    }
+
+
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(
+        output_dir="outputs",
+        learning_rate=2e-5,
+    ),
+    train_dataset=dataset,
+    data_collator=collate,
+)
+trainer.train()
+```
+
+`dataset` is any `torch.utils.data.Dataset` or `datasets.Dataset` whose items carry an `image` and a
+`mask` — the collator is what adapts your field names, so nothing else has to change.
+
+`segmentation_maps` are resized and rescaled like the images but never normalized, then binarized at
+0.5 — BiRefNet trains against a hard mask even though it predicts a soft one. The channel dimension is
+kept, so `labels` arrive as `(B, 1, H, W)`.
+
+The loss is `birefnet_loss`: a multi-scale objective over the decoder's whole prediction pyramid,
+weighted BCE (×30) + IoU (×0.5) + SSIM (×10) per scale, with predictions bilinearly resized to the
+label when they do not match. `forward` also returns the intermediate scales as
+`intermediate_logits`, which is what makes the multi-scale term possible.
+
+## Swapping the loss
+
+`model.criterion` is a plain function attribute, not a submodule, so it never enters the state dict
+and you can replace it outright:
+
+```python
+from nobg.loss import birefnet_loss, iou_loss, ssim_loss
+
+
+def my_loss(scaled_preds, gt):
+    return birefnet_loss(scaled_preds, gt) + 5 * iou_loss(
+        scaled_preds[-1].sigmoid(), gt
+    )
+
+
+model.criterion = my_loss
+```
+
+The signature is `(scaled_preds: list[Tensor], gt: Tensor) -> Tensor`, where `scaled_preds` are raw
+logits at possibly differing resolutions and `gt` is `(B, 1, H, W)` in `[0, 1]`. See the
+[losses reference](/docs/reference/losses) for everything that ships.
+
+## SAM3
+
+Start from MultiMatte, and take the processor from the same repo so the tokenizer matches.
+
+`Sam3.forward` takes `labels` the same way and defaults to `sam3_loss` — SAM 3's own
+semantic-segmentation objective, weighted focal (×20, `alpha=0.6`) + dice (×30) — so fine-tuning
+matches how the checkpoint was trained. `Sam3` always passes a single-element `scaled_preds` list.
+
+Two differences from BiRefNet:
+
+- **Labels are yours to build.** `Sam3Processor` inherits `transformers`' processor, which handles
+  images, text and boxes but not `segmentation_maps`. Resize your masks to `config.image_size` and
+  pass a `(B, 1, H, W)` float tensor.
+- **Every batch needs a prompt.** Include `input_ids` and `attention_mask` from the processor in the
+  collated batch; without them `forward` raises.
+
+```python
+import torch
+import torch.nn.functional as F
+from nobg import AutoModel, AutoProcessor
+from transformers import Trainer, TrainingArguments
+
+model = AutoModel.from_pretrained("feyninc/multimatte")
+processor = AutoProcessor.from_pretrained("feyninc/multimatte")
+
+size = model.config.image_size
+
+
+def collate(examples):
+    batch = processor(
+        images=[example["image"] for example in examples],
+        text="the main foreground subject",
+        return_tensors="pt",
+    )
+    masks = torch.stack(
+        [
+            F.interpolate(
+                torch.as_tensor(example["mask"], dtype=torch.float32)[None, None]
+                / 255,
+                size=(size, size),
+                mode="bilinear",
+                align_corners=False,
+            )[0]
+            for example in examples
+        ]
+    )
+    return {
+        "pixel_values": batch["pixel_values"],
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+        "labels": masks,
+    }
+
+
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(
+        output_dir="outputs",
+        learning_rate=2e-5,
+    ),
+    train_dataset=dataset,
+    data_collator=collate,
+)
+trainer.train()
+```
+
+<Callout title="What sam3_loss deliberately leaves out">
+  SAM 3's full criterion also has Hungarian-matched set losses (box L1/GIoU, classification,
+  per-instance mask/dice) and a presence-head BCE. Neither applies here: `nobg` trains on a single
+  merged matte, so there are no instance-level targets to match, and every training pair has a
+  foreground, so the presence target is constantly 1 and carries no signal.
+</Callout>
+
+## Practical notes
+
+- **Freeze what you can.** These are 0.3–0.84 B models at 1008–1024 px. `peft` is in the project's
+  `train` dependency group for exactly this.
+- **Resolution costs quadratically.** Fine-tuning at a smaller `image_size` and
+  [re-parameterizing](/docs/guides/hub#re-parameterizing-a-checkpoint) afterwards is a legitimate
+  strategy.
+- **Evaluate with `nobg.metrics`.** MAE, S-measure, F/E-measure, boundary IoU and the matting metrics
+  are all pure torch; see [Evaluation](/docs/guides/evaluation).
+- **Push the result.** `model.push_to_hub(...)` and `processor.push_to_hub(...)` write a checkpoint
+  that `AutoModel` can load back; see [Hub round-trips](/docs/guides/hub).

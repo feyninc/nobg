@@ -1,0 +1,125 @@
+---
+title: Losses
+description: birefnet_loss, sam3_loss and the terms they are built from.
+---
+
+```python
+from nobg.loss import birefnet_loss, sam3_loss
+```
+
+Every loss has the same signature — a **list** of prediction tensors and one ground truth — so it can be
+assigned to `model.criterion` as-is:
+
+```python
+def my_loss(scaled_preds: list[Tensor], gt: Tensor) -> Tensor: ...
+
+model.criterion = my_loss
+```
+
+`scaled_preds` are **raw logits**, not probabilities: BiRefNet passes its final scale plus every
+intermediate decoder scale, `Sam3` always passes a single-element list. Any prediction whose spatial
+size differs from `gt` is bilinearly resized to match, so the intermediate scales need no handling from
+the caller. `gt` is `(B, 1, H, W)` in `[0, 1]`.
+
+`criterion` is a plain function attribute, not a submodule — it never enters the state dict, and
+replacing it is just an assignment.
+
+## `birefnet_loss`
+
+```python
+birefnet_loss(scaled_preds, gt) -> Tensor
+```
+
+The default for `BiRefNet`, matching the paper's training recipe. Each scale contributes three terms:
+
+| Term | Weight | On |
+| :--- | :---: | :--- |
+| `binary_cross_entropy_with_logits` | 30 | logits |
+| `iou_loss` | 0.5 | sigmoided |
+| `ssim_loss` | 10 | sigmoided |
+
+Summed over every scale — so the value grows with the number of decoder scales; it is a training signal,
+not a comparable metric.
+
+### `iou_loss`
+
+```python
+iou_loss(pred, target) -> Tensor
+```
+
+`1 - soft IoU`, per-sample over spatial dims then batch-averaged. Expects **probabilities**.
+
+### `ssim_loss`
+
+```python
+ssim_loss(pred, target) -> Tensor
+```
+
+`(1 - SSIM) / 2` clamped to `[0, 1]`, over 3×3 windows via `avg_pool2d`, with the standard `C1 = 0.01²`,
+`C2 = 0.03²`. Expects **probabilities**. This is the term that pushes local structure — edges and thin
+detail — rather than per-pixel correctness.
+
+## `sam3_loss`
+
+```python
+sam3_loss(scaled_preds, gt, *, focal_alpha=0.6, focal_gamma=2.0,
+          focal_weight=20.0, dice_weight=30.0) -> Tensor
+```
+
+The default for `Sam3` — SAM 3's semantic-segmentation objective, so fine-tuning matches how the
+checkpoint was trained: `20 × focal + 30 × dice` at Meta's published relative weights.
+
+The keyword arguments make it tunable without rewriting it:
+
+```python
+from functools import partial
+
+model.criterion = partial(sam3_loss, dice_weight=10.0)
+```
+
+<Callout title="Written from the formulation, not copied">
+  Meta's `SemanticSegCriterion` is under the SAM License; nobg is Apache-2.0. This is an independent
+  implementation of the same published objective.
+</Callout>
+
+<Callout type="warn" title="What it deliberately omits">
+  The Hungarian-matched set losses (box L1/GIoU, classification, per-instance mask/dice) need
+  instance-level targets, and nobg trains on a single merged matte — there is nothing to match. The
+  presence-head BCE needs a per-image "is the concept present" label, and every training pair here has a
+  foreground, so that target is constantly 1 and carries no useful gradient. If you need either, write a
+  criterion that reads the instance outputs off `forward` directly.
+</Callout>
+
+### `sigmoid_focal_loss`
+
+```python
+sigmoid_focal_loss(pred, target, alpha=0.6, gamma=2.0) -> Tensor
+```
+
+Focal loss ([arXiv:1708.02002](https://arxiv.org/abs/1708.02002)) on **raw logits**, mean-reduced. Note
+`alpha=0.6`, not RetinaNet's 0.25: SAM 3's semantic head favours the foreground, because a matte's
+positive class covers a large fraction of the image rather than a handful of anchors. Pass `alpha=-1` to
+disable the class weighting entirely.
+
+### `dice_loss`
+
+```python
+dice_loss(pred, target) -> Tensor
+```
+
+Soft dice on **raw logits**: `1 - 2|X∩Y| / (|X|+|Y|)`, smoothed by 1, per-sample over flattened spatial
+dims then batch-averaged. The mask-overlap term of DETR-family set losses, which SAM 3 inherits.
+
+## Choosing
+
+| Situation | Criterion |
+| :--- | :--- |
+| Fine-tuning BiRefNet | `birefnet_loss` (default) |
+| Fine-tuning SAM3 | `sam3_loss` (default) |
+| Hard binary masks, class imbalance | `sam3_loss` — focal handles the imbalance |
+| Soft mattes, hair and fur | `birefnet_loss` — SSIM rewards local structure |
+
+Mixing is legal — `BiRefNet.criterion = sam3_loss` works, since the signature is shared — but you are
+then no longer matching the recipe the weights were trained under.
+
+Evaluating, as opposed to training, is [Metrics](/docs/reference/metrics).

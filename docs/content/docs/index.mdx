@@ -1,0 +1,81 @@
+---
+title: Introduction
+description: What nobg is, what ships in it, and where to go next.
+icon: House
+---
+
+`nobg` is an open-source Python library for **background removal and image matting**. It packages
+matting models, their image processors, the losses they were trained with and the metrics they are
+evaluated on, behind one small API — and it reads from and writes to the HuggingFace Hub at both
+ends.
+
+```python
+from nobg import AutoModel
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg")
+model.process("input.jpg").save("output.png")
+```
+
+That is the whole thing: `process` loads the image, builds the processor the model's own config
+implies, runs the forward pass under `no_grad` in eval mode, post-processes the logits into an alpha
+matte at the original resolution, and composites an RGBA cutout.
+
+## The output contract
+
+Every model in `nobg` returns the same thing: raw alpha-matte logits of shape `(B, 1, H, W)` under
+the key `logits`. That is what makes the models interchangeable, and what lets one shared
+post-processing path serve all of them:
+
+| Piece | Role |
+| :--- | :--- |
+| `model(**inputs)["logits"]` | Raw matte logits, not sigmoided |
+| `processor.post_process_alpha_matting(outputs, target_sizes=...)` | Logits → `(H, W)` mattes in `[0, 1]`, one per image, each at its own target size |
+| `processor.refine_foreground(image, alpha)` | Unmixed foreground colors, to kill halo fringing |
+| `processor.cutout(image, alpha)` | RGBA cutout |
+| `model.predict(processor, image)` | All of the above in one call |
+| `model.process(image)` | `predict` with the processor it builds itself |
+
+Models expose extra outputs on top of that contract — BiRefNet its `intermediate_logits`, SAM3 its
+whole instance-detection head — but never instead of it.
+
+## What ships in the package
+
+<Cards>
+  <Card title="Models" href="/docs/models" description="FeyNobg (BiRefNet) and MultiMatte (SAM3), with the strengths of each." />
+  <Card title="Processors" href="/docs/reference/processors" description="Preprocessing, post-processing, foreground refinement and compositing." />
+  <Card title="Losses" href="/docs/reference/losses" description="BiRefNet's BCE+IoU+SSIM and SAM3's focal+dice objectives." />
+  <Card title="Metrics" href="/docs/reference/metrics" description="MAE, S/F/E-measure, boundary IoU and the matting metrics, in pure torch." />
+</Cards>
+
+## Where to go next
+
+<Cards>
+  <Card title="Installation" href="/docs/installation" description="uv, pip, torch and the ONNX extra." />
+  <Card title="Quickstart" href="/docs/quickstart" description="Three lines to a cutout, then the pieces underneath." />
+  <Card title="Text prompts" href="/docs/guides/text-prompts" description="Cut out a named subject, or one pointed at with a box." />
+  <Card title="Fine-tuning" href="/docs/guides/fine-tuning" description="Train on your own image/mask pairs with the HuggingFace Trainer." />
+</Cards>
+
+## Links
+
+- [GitHub](https://github.com/feyninc/nobg) — source, issues and the contributing guide
+- [PyPI](https://pypi.org/project/nobg/) — releases
+- [🤗 FeyNobg](https://huggingface.co/feyninc/FeyNobg) — the default checkpoint
+- [🤗 MultiMatte](https://huggingface.co/feyninc/multimatte) — the text-promptable one
+- [🤗 Space](https://huggingface.co/spaces/feyninc/feynobg) — try it in the browser
+
+## License and citation
+
+`nobg` is Apache-2.0. Meta's SAM weights are **not** redistributed: converting them with
+`Sam3.from_origin("facebook/sam3")` downloads them from Meta's gated repo under Meta's own
+[SAM License](https://huggingface.co/facebook/sam3/blob/main/LICENSE).
+
+```bibtex
+@software{nobg,
+  title={nobg: Open Source Background Removal Models for Image and Video Matting},
+  author={Hichri, Hafedh},
+  year={2026},
+  url={https://github.com/feyninc/nobg},
+  license={Apache-2.0},
+}
+```

@@ -1,0 +1,76 @@
+---
+title: AutoModel & AutoProcessor
+description: Tag-based dispatch to the concrete model and processor classes.
+---
+
+```python
+from nobg import AutoModel, AutoProcessor
+```
+
+## `AutoModel.from_pretrained`
+
+```python
+AutoModel.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+```
+
+Reads the repo's Hub tags via `model_info`, then delegates to the concrete class's own
+`from_pretrained` with every argument untouched.
+
+| Tags | Class | Published checkpoint |
+| :--- | :--- | :--- |
+| `nobg-birefnet`, `birefnet` | `BiRefNet` | `feyninc/FeyNobg` |
+| `nobg-sam3`, `sam3` | `Sam3` | `feyninc/multimatte` (MultiMatte) |
+
+Anything else raises `ValueError("this model is not part of nobg")`.
+
+<Callout title="Needs the network">
+  Tag lookup is a Hub API call, so `AutoModel` cannot resolve a purely local directory. Use the
+  concrete class (`BiRefNet.from_pretrained("./my-model")`) for offline loads.
+</Callout>
+
+## `AutoProcessor.from_pretrained`
+
+```python
+AutoProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
+```
+
+Reads `preprocessor_config.json` (or the nested `image_processor` block of `processor_config.json`) and
+dispatches on the recorded `image_processor_type`, then re-loads through that class's own
+`from_pretrained` so all keyword arguments are handled the way the class expects.
+
+| `image_processor_type` | Class |
+| :--- | :--- |
+| `BiRefNetImageProcessor` | `BiRefNetImageProcessor` |
+| `Sam3Processor` | `Sam3Processor` |
+| `Sam3ImageProcessor`, `Sam3ImageProcessorFast` | `Sam3Processor` |
+
+The last two are upstream type names: a raw `transformers` SAM3 repo such as `facebook/sam3` records
+them, and nobg's `Sam3Processor` is a drop-in superset, so they map onto it rather than raising.
+
+### Fallback for repos without a processor config
+
+If the file is missing (legacy BiRefNet checkpoints), `AutoProcessor` falls back to the Hub tags plus
+`config.json`:
+
+- BiRefNet → `BiRefNetImageProcessor(size=config.image_size)`, defaulting to 1024
+- SAM3 → `Sam3Processor` with a size-only image processor (defaulting to 1008), the repo's own
+  tokenizer, and `default_prompt` from the config
+
+## Model tags
+
+Models self-declare their tags at class-definition time, which is what makes both dispatchers work
+after a `push_to_hub`:
+
+```python
+class BiRefNet(
+    nn.Module,
+    Revised_Mixin,
+    library_name="nobg",
+    repo_url="https://github.com/feyninc/nobg",
+    tags=["nobg", "nobg-birefnet"],
+    ...
+):
+```
+
+Every model carries `"nobg"` plus one unique model tag. See [Contributing](/docs/contributing) for the
+rules a new model has to follow.

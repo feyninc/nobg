@@ -1,0 +1,197 @@
+---
+title: ONNX
+description: Onnx_Mixin's export/push/load methods and the OnnxModel wrapper.
+---
+
+```python
+from nobg import OnnxModel
+```
+
+`Onnx_Mixin` is part of `Revised_Mixin`, so every nobg model has ONNX counterparts of the three Hub
+methods. Both the export and the runtime need the extra: `pip install "nobg[onnx]"`.
+
+The task-oriented version of this page is [ONNX export](/docs/guides/onnx).
+
+## `onnx_save_pretrained`
+
+```python
+onnx_save_pretrained(
+    save_directory, *,
+    config=None, file_name="model.onnx", subfolder=None,
+    batch_size=1, opset_version=19, dummy_inputs=None,
+    model_card=None, model_card_kwargs=None, **export_kwargs,
+) -> str
+```
+
+Returns the path of the written `.onnx` file.
+
+<TypeTable
+  type={{
+    save_directory: { description: 'Directory to write to; created if needed.', type: 'str | Path', required: true },
+    config: { description: "Config to record, as a dict or dataclass. Defaults to the model's own.", type: 'dict | dataclass | None', default: 'None' },
+    file_name: { description: 'Name of the ONNX file.', type: 'str', default: '"model.onnx"' },
+    subfolder: { description: 'Folder within save_directory to write into. "onnx" is the convention for sharing a directory with the torch checkpoint. The subfolder gets its own config.json, so it is self-contained.', type: 'str | None', default: 'None' },
+    batch_size: { description: 'Batch size to trace at — and the only one the graph accepts. Ignored when dummy_inputs is given.', type: 'int', default: '1' },
+    opset_version: { description: 'ONNX opset to target. 19 is the floor: DeformConv, which BiRefNet lowers to, is an opset-19 operator, and a lower opset exports but fails to load in onnxruntime.', type: 'int', default: '19' },
+    dummy_inputs: { description: 'Tracing inputs, overriding onnx_dummy_inputs(). Use it to trace a variant — a box-promptable SAM3, or images at a non-default size.', type: 'dict[str, Tensor] | None', default: 'None' },
+    model_card: { description: 'Whether to write a README.md. None writes one unless subfolder is set, since a card nested under onnx/ is not the one the Hub renders.', type: 'bool | None', default: 'None' },
+    model_card_kwargs: { description: 'Extra arguments for the model card template.', type: 'dict | None', default: 'None' },
+  }}
+/>
+
+Anything else in `**export_kwargs` goes straight to `torch.onnx.export`, so `dynamo`,
+`dynamic_shapes`, `external_data`, `optimize` and `verify` stay reachable.
+
+Raises `ValueError` if the tracing inputs are empty. The model's training mode is restored afterwards
+even if the export raises.
+
+### Large exports
+
+A graph whose initializers exceed the 2 GB protobuf limit gets a `model.onnx.data` beside it. That file
+is part of the export — keep the directory together.
+
+The two exporters spill differently: the `torch.export` path writes one `.data` file, while the
+TorchScript path's C++ serializer writes **one file per tensor** (609 files for a 3.36 GB SAM3 export).
+Every export therefore runs a consolidation step that rewrites the many-file layout into the one-file
+layout `optimum` and `onnxruntime` expect. It is a no-op when there is no external data or the data is
+already in one file.
+
+## `onnx_push_to_hub`
+
+```python
+onnx_push_to_hub(
+    repo_id, *,
+    config=None, commit_message="Push ONNX model using huggingface_hub.",
+    private=None, token=None, branch=None, create_pr=None,
+    allow_patterns=None, ignore_patterns=None, delete_patterns=None,
+    file_name="model.onnx", subfolder=None, batch_size=1, opset_version=19,
+    dummy_inputs=None, update_model_card=True, model_card_kwargs=None, **export_kwargs,
+) -> str
+```
+
+Exports to a temporary directory and uploads it, returning the commit URL. A `repo_id` with no `/` is
+prefixed with your Hub username.
+
+With `subfolder=`, the upload is scoped with `path_in_repo`, so only that folder is committed — the
+`model.safetensors` beside it, the processor config and any eval assets are untouched. The repo's root
+model card is then **patched** in a second commit: it gains the `onnx` tag and a "how to load the ONNX
+export" section if they aren't already there. Both edits are conditional, so re-pushing leaves the card
+byte-identical, and a hand-written card survives. `update_model_card=False` skips it.
+
+<Callout title="A card failure never fails the push">
+  The weights are the expensive part and they are already up by then, so a card that cannot be read,
+  patched or pushed is logged as a warning with instructions, not raised.
+</Callout>
+
+`delete_patterns` is scoped to `subfolder` like the upload. `update_model_card` is ignored without
+`subfolder`, where the export writes the card itself.
+
+## `onnx_from_pretrained`
+
+```python
+@classmethod
+onnx_from_pretrained(
+    pretrained_model_name_or_path, *,
+    file_name="model.onnx", subfolder=None,
+    providers=None, provider_options=None, session_options=None,
+    revision=None, token=None, cache_dir=None,
+    force_download=False, local_files_only=False,
+) -> OnnxModel
+```
+
+Nothing is instantiated in torch — the graph goes to onnxruntime and comes back wrapped in an
+[`OnnxModel`](#onnxmodel) carrying this class's `config`, decoded from `config.json` through the Hub
+mixin's own decoder so unknown fields drop exactly as `from_pretrained` drops them.
+
+<TypeTable
+  type={{
+    pretrained_model_name_or_path: { description: 'A Hub repo id, or a local directory holding the export.', type: 'str | Path', required: true },
+    subfolder: { description: 'Folder holding the graph. Also narrows the download to that folder plus the root metadata, so pulling a graph out of a torch repo does not drag the safetensors along.', type: 'str | None', default: 'None' },
+    providers: { description: 'onnxruntime execution providers, highest priority first. Defaults to every provider installed, so a GPU build uses the GPU. Pass ["CPUExecutionProvider"] to pin to CPU.', type: 'list | None', default: 'None' },
+    provider_options: { description: 'Per-provider option dicts, aligned with providers.', type: 'list[dict] | None', default: 'None' },
+    session_options: { description: 'An onnxruntime.SessionOptions, for thread counts and graph-optimization level.', type: 'SessionOptions | None', default: 'None' },
+    revision: { description: 'Hub revision — branch, tag or commit.', type: 'str | None', default: 'None' },
+    local_files_only: { description: 'Never hit the network.', type: 'bool', default: 'false' },
+  }}
+/>
+
+Torch weight formats (`*.safetensors`, `*.bin`, `*.pt`, `*.pth`, `*.ckpt`, `*.h5`, `*.msgpack`) are
+skipped when downloading; everything else is fetched, because a large export's sidecar data is named
+after tensors and cannot be filtered by name.
+
+`config.json` is read from beside the graph first, then the repo root — the Hub convention keeps a
+checkpoint's config at the root, so a subfolder export may have none of its own. Missing graph →
+`FileNotFoundError` naming `file_name=`, `subfolder=` and `from_pretrained` as the three fixes.
+
+## `onnx_dummy_inputs`
+
+```python
+onnx_dummy_inputs(batch_size=1) -> dict[str, Tensor]
+```
+
+Names, shapes and **orders** the graph's inputs — the keys become the ONNX input names, in the order
+`forward` receives them. The default returns `pixel_values` sized from `config.image_size`; a model
+whose `forward` needs more extends it. `Sam3` adds `input_ids` and `attention_mask`.
+
+Raises `NotImplementedError` if the config has no `image_size` and the method isn't overridden.
+
+## `onnx_dynamo`
+
+A class attribute picking the exporter:
+
+| Value | Path | Used by |
+| :--- | :--- | :--- |
+| `True` | `torch.export` | `BiRefNet` — torchvision no longer registers an ONNX symbolic for `deform_conv2d`, so TorchScript cannot lower it |
+| `False` | TorchScript tracer | `Sam3` — its decoder sizes tensors from data, which `torch.export` refuses to guard on |
+| `None` | torch decides | — |
+
+Ignored on torch < 2.5, whose `torch.onnx.export` has no `dynamo` parameter.
+
+## What the graph is
+
+The traced wrapper returns `forward(**inputs)["logits"]` and nothing else, so BiRefNet's
+`intermediate_logits` and SAM3's instance heads (`pred_masks`, `presence_logits`, …) are pruned. Keep
+the torch model for those.
+
+<Callout type="warn" title="Shapes are fixed at export time — batch size included">
+  `transformers`' Swin windowing reshapes with Python ints, which pins the batch no matter what
+  `dynamic_axes`/`dynamic_shapes` claim, so nothing is marked dynamic by default. Export at the batch
+  size you'll run at, and read it back off `model.batch_size`.
+</Callout>
+
+## `OnnxModel`
+
+Quacks like the torch model where it matters: callable with the same keyword inputs, returning a dict of
+torch tensors with the same `logits`, carrying the same `config` — which is what lets the shared
+`predict` run against it unchanged. It is **not** an `nn.Module`: no parameters, no autograd, no
+training.
+
+| Member | Notes |
+| :--- | :--- |
+| `predict(processor, image, prompt=None, boxes=None, *, batch_size=None, return_type="cutout", **processor_kwargs)` | Same arguments and returns as the torch models'. `batch_size` defaults to the graph's own |
+| `process(image, prompt=None, boxes=None, *, tokenizer=None, batch_size=None, return_type="cutout", **processor_kwargs)` | `predict` with `default_processor()` |
+| `default_processor(*args, **kwargs)` | Delegates to the torch class's method with this object standing in — that method reads only the config (and for SAM3 the tokenizer source), so the processor is identical |
+| `forward(**inputs)` / `__call__` | Runs the graph. Torch tensors and numpy arrays both accepted; tensors are moved to CPU and cast to the declared dtype |
+| `config` | The decoded config dataclass |
+| `input_names` / `output_names` | The graph's names, in order |
+| `batch_size` | What the graph was traced at; 1 if the batch dimension is symbolic |
+| `providers` | Execution providers the session is running on |
+| `path` | Where the graph was loaded from |
+| `parameters()` | Deliberately empty, so `predict` reads it as a CPU float32 model — what the session takes |
+| `eval()` | No-op; a graph is always in inference mode |
+| `train(mode=True)` | `RuntimeError` for `mode=True`; load the torch model to fine-tune |
+
+`forward` validates the feed: an unknown key is a `TypeError` and a missing one a `ValueError`, both
+listing the inputs the graph actually takes.
+
+```python
+model = BiRefNet.onnx_from_pretrained("your-username/model-name-onnx")
+print(model)
+# OnnxModel(BiRefNet, inputs=['pixel_values'], batch_size=1, providers=[...])
+```
+
+## Parity
+
+`tests/test_mixin.py` exports each model and asserts torch-vs-onnxruntime agreement on `logits`. The
+traced SAM3 graph matches torch to ~5e-7 for any prompt, not just the traced one. If you add a model,
+that assertion is part of the contract — see [Contributing](/docs/contributing).

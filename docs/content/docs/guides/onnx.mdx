@@ -1,0 +1,121 @@
+---
+title: ONNX export
+description: Export the matte to ONNX, push it, and run it under onnxruntime with the same API.
+icon: Package
+---
+
+Every model has an ONNX counterpart of the three Hub methods. They need the extra:
+
+```bash
+uv add "nobg[onnx]"
+```
+
+## Export
+
+```python
+model.onnx_save_pretrained("onnx-out")   # -> onnx-out/model.onnx + config.json + README.md
+model.onnx_push_to_hub("your-username/model-name-onnx")
+```
+
+The export is the alpha matte alone: a wrapper traces `forward(**inputs)["logits"]`, so the auxiliary
+outputs are pruned. A model whose initializers exceed the 2 GB protobuf limit also gets a
+`model.onnx.data` beside the graph — that file is part of the export, so keep the directory together.
+
+## Load and run
+
+Loading gives back an `OnnxModel` — the graph under `onnxruntime`, with the same `process`, `predict`,
+`default_processor` and `config` as the torch model, so it drops into existing code unchanged:
+
+```python
+from nobg import BiRefNet
+
+model = BiRefNet.onnx_from_pretrained("your-username/model-name-onnx")
+model.process("input.jpg").save("output.png")
+```
+
+`providers=` picks the execution provider (the default is everything installed, so an
+`onnxruntime-gpu` build uses the GPU); `session_options=` takes an `onnxruntime.SessionOptions`.
+
+```python
+model = BiRefNet.onnx_from_pretrained(
+    "your-username/model-name-onnx",
+    providers=["CPUExecutionProvider"],
+)
+print(model)  # OnnxModel(BiRefNet, inputs=['pixel_values'], batch_size=1, providers=[...])
+```
+
+## Sharing a repo with the torch weights
+
+A dedicated `-onnx` repo is one option; `subfolder=` is the other, and it is the convention `optimum`
+and `transformers.js` already look in. All three calls take it:
+
+```python
+model.onnx_save_pretrained("out", subfolder="onnx")   # -> out/onnx/model.onnx + config.json
+model.onnx_push_to_hub("your-username/model-name", subfolder="onnx")
+
+model = BiRefNet.onnx_from_pretrained("your-username/model-name", subfolder="onnx")
+```
+
+The push is scoped with `path_in_repo`, so it writes `onnx/` and nothing else — the
+`model.safetensors` beside it, the processor config and any eval assets are not part of the commit.
+The repo's model card is then **patched** in a second, separate commit rather than regenerated: it
+gains the `onnx` tag and a "how to load the ONNX export" section if they aren't already there, so
+re-pushing is idempotent and a hand-written card survives. Pass `update_model_card=False` to leave the
+card alone entirely; `onnx_save_pretrained` takes `model_card=` for the same decision locally, its
+default being "no `README.md` inside a subfolder", since the directory it joins already has one.
+
+Loading with `subfolder=` narrows the download to that folder plus the root metadata, so pulling a
+graph out of a torch repo doesn't drag the safetensors along. `config.json` is read from the subfolder
+if it's there and from the repo root otherwise, since that's where the Hub convention keeps it.
+
+## Two things differ from the torch model
+
+<Callout type="warn" title="Shapes are fixed at export time — batch size included">
+  `transformers`' Swin windowing reshapes with Python ints, which pins the batch no matter what
+  `dynamic_axes` claims. Export at the batch size you'll run at, and read it back off
+  `model.batch_size`.
+</Callout>
+
+```python
+model.onnx_save_pretrained("onnx-out", batch_size=4)
+```
+
+**Only the matte is exported.** The graph returns `logits` alone, without BiRefNet's
+`intermediate_logits` or SAM3's instance heads (`pred_masks`, `presence_logits`, …). Keep the torch
+model for those.
+
+## Tracing inputs
+
+The graph's inputs come from `onnx_dummy_inputs()` — `pixel_values` for BiRefNet, plus `input_ids` and
+`attention_mask` for SAM3, whose text prompt is therefore baked in as *shape* only: any prompt
+`Sam3Processor` produces (it pads to 32 tokens) runs on the same graph. Pass `dummy_inputs=` to trace
+a variant, e.g. a box-promptable SAM3:
+
+```python
+inputs = model.onnx_dummy_inputs()
+inputs["input_boxes"] = torch.zeros(1, 1, 4)  # one box per image — only the shape is traced
+model.onnx_save_pretrained("onnx-out", dummy_inputs=inputs)
+```
+
+Every entry must be a tensor `forward` accepts, since the graph requires all of its inputs at
+inference — which is exactly why `input_boxes` is left out by default. Anything else goes to
+`torch.onnx.export`, `opset_version` included (the default, 19, is the floor for BiRefNet's
+`DeformConv`).
+
+## Which exporter runs
+
+`onnx_dynamo` picks the path, and each model sets it to what it needs:
+
+| Model | `onnx_dynamo` | Why |
+| :--- | :---: | :--- |
+| `BiRefNet` | `True` (`torch.export`) | torchvision no longer registers an ONNX symbolic for `deform_conv2d`, so the TorchScript exporter cannot lower it |
+| `Sam3` | `False` (TorchScript) | its decoder sizes tensors from data, which `torch.export` refuses to guard on (`GuardOnDataDependentSymNode`) |
+
+Nothing is lost in either direction: the traced SAM3 graph matches torch to ~5e-7 for any prompt, not
+just the traced one.
+
+## Parity
+
+The round-trip is tested: `tests/test_mixin.py` exports each model and asserts torch-vs-onnxruntime
+agreement on `logits`. If you add a model, that assertion is part of the contract — see
+[Contributing](/docs/contributing).

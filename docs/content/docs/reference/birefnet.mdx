@@ -1,0 +1,175 @@
+---
+title: BiRefNet
+description: The bilateral reference matting model — config, forward, and its methods.
+---
+
+```python
+from nobg import BiRefNet
+from nobg.birefnet.modeling_birefnet import BiRefNetConfig
+```
+
+Bilateral Reference Network for high-resolution dichotomous image segmentation
+([arXiv:2401.03407](https://arxiv.org/abs/2401.03407)), with a Swin backbone from `transformers`.
+`feyninc/FeyNobg` is the published checkpoint.
+
+## `BiRefNetConfig`
+
+A plain dataclass; every field has a default, so `BiRefNet()` is valid (randomly initialized). It is
+serialized verbatim to `config.json`.
+
+<TypeTable
+  type={{
+    image_size: {
+      description: 'Square input resolution the model is built for.',
+      type: 'int',
+      default: '1024',
+    },
+    patch_size: { description: 'Swin patch size.', type: 'int', default: '4' },
+    embed_dim: {
+      description: 'Swin embedding width. Stage channels are embed_dim · 2^i.',
+      type: 'int',
+      default: '192',
+    },
+    num_layers: {
+      description: 'Number of backbone stages. Must match len(depths) and len(num_heads).',
+      type: 'int',
+      default: '4',
+    },
+    depths: { description: 'Blocks per stage.', type: 'list[int]', default: '[2, 2, 18, 2]' },
+    num_heads: {
+      description: 'Attention heads per stage.',
+      type: 'list[int]',
+      default: '[6, 12, 24, 48]',
+    },
+    window_size: { description: 'Swin attention window.', type: 'int', default: '12' },
+    mlp_ratio: { description: 'Swin MLP expansion ratio.', type: 'float', default: '4.0' },
+    drop_path_rate: { description: 'Stochastic depth rate.', type: 'float', default: '0.2' },
+    dec_channels_inter: {
+      description: 'Intermediate width inside each decoder block.',
+      type: 'int',
+      default: '64',
+    },
+    use_multi_scale_input: {
+      description: 'Also run the backbone on a half-resolution copy and concatenate the features, doubling the channels the decoder sees.',
+      type: 'bool',
+      default: 'true',
+    },
+    use_gradient_attention: {
+      description: "Enable the decoder's gradient-attention path.",
+      type: 'bool',
+      default: 'true',
+    },
+    use_image_patch_injection: {
+      description: 'Inject image patches into the decoder at each scale.',
+      type: 'bool',
+      default: 'true',
+    },
+    nobg_version: {
+      description: 'Version of nobg that built the config; recorded for provenance.',
+      type: 'str',
+      default: 'installed version',
+    },
+  }}
+/>
+
+`__post_init__` raises if `depths` or `num_heads` disagree with `num_layers`.
+
+```python
+model = BiRefNet(BiRefNetConfig(image_size=512, embed_dim=128))
+```
+
+## `forward`
+
+```python
+forward(pixel_values: Tensor, labels: Tensor | None = None) -> dict
+```
+
+<TypeTable
+  type={{
+    pixel_values: {
+      description: '(B, 3, H, W) preprocessed images.',
+      type: 'Tensor',
+      required: true,
+    },
+    labels: {
+      description: '(B, 1, H, W) binary masks. When given, loss is added to the output.',
+      type: 'Tensor | None',
+      default: 'None',
+    },
+  }}
+/>
+
+Returns:
+
+| Key | Shape | Notes |
+| :--- | :--- | :--- |
+| `logits` | `(B, 1, H, W)` | Raw alpha-matte logits — the final decoder scale, **not** sigmoided |
+| `intermediate_logits` | list of `(B, 1, h, w)` | The earlier decoder scales, used by the multi-scale loss |
+| `loss` | scalar | Only when `labels` was passed; computed by `model.criterion` |
+
+Unlike SAM3, `forward` accepts no prompt and no boxes.
+
+## `predict`
+
+```python
+predict(processor, image, *, batch_size=1, return_type="cutout", **processor_kwargs)
+```
+
+The full preprocess → forward → post-process → composite pipeline, under `no_grad` in eval mode on the
+model's own device and dtype. A single image returns a single result; a list returns a list, each at its
+original resolution.
+
+`processor` must be a `BiRefNetImageProcessor`. BiRefNet's signature stops at `image` — passing a third
+positional argument is a `TypeError`.
+
+See [Removing a background](/docs/guides/background-removal) for the full argument table.
+
+## `process`
+
+```python
+process(image, *, batch_size=1, return_type="cutout", **processor_kwargs)
+```
+
+`predict` with the processor `default_processor()` describes. Everything else is forwarded unchanged.
+
+## `default_processor`
+
+```python
+default_processor() -> BiRefNetImageProcessor
+```
+
+Builds `BiRefNetImageProcessor(size={"height": config.image_size, "width": config.image_size})`.
+BiRefNet's preprocessing is fully determined by the config, so this needs nothing from the Hub — it
+mirrors `AutoProcessor`'s fallback for repos without a `preprocessor_config.json`.
+
+## `from_origin`
+
+```python
+@classmethod
+from_origin(origin, config=None, *, token=None, **overrides) -> BiRefNet
+```
+
+Builds a possibly re-parameterized model from an existing one, injecting every weight whose (remapped)
+key and shape still match. Understands both the current key layout and the pre-0.2.0 custom-Swin
+layout. See [Hub round-trips](/docs/guides/hub#re-parameterizing-a-checkpoint).
+
+## `criterion`
+
+```python
+model.criterion = my_loss   # (scaled_preds: list[Tensor], gt: Tensor) -> Tensor
+```
+
+Defaults to `nobg.loss.birefnet_loss`. It is a plain function attribute, not a submodule, so it never
+enters the state dict and can be replaced outright. See [Losses](/docs/reference/losses).
+
+## Inherited
+
+From `Revised_Mixin` (`PyTorchModelHubMixin` + `Onnx_Mixin`):
+
+- `save_pretrained`, `from_pretrained`, `push_to_hub` — the last auto-prefixes a bare `repo_id` with
+  your Hub username and injects the generated model card
+- `onnx_save_pretrained`, `onnx_push_to_hub`, `onnx_from_pretrained`, `onnx_dummy_inputs` — see
+  [ONNX](/docs/reference/onnx)
+
+`onnx_dynamo` is `True` for BiRefNet: the `torch.export` path is required, because torchvision no
+longer registers an ONNX symbolic for `deform_conv2d`.

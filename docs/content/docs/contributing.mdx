@@ -1,0 +1,217 @@
+---
+title: Contributing
+description: Setup, the invariants a new model must respect, and what CI checks.
+icon: GitPullRequest
+---
+
+The full rules live in [`AGENTS.md`](https://github.com/feyninc/nobg/blob/main/AGENTS.md) and
+[`CONTRIBUTING.md`](https://github.com/feyninc/nobg/blob/main/CONTRIBUTING.md) in the repo. This page is
+the working summary.
+
+## Setup
+
+```bash
+git clone https://github.com/feyninc/nobg.git
+cd nobg
+uv sync
+```
+
+`uv sync` includes the `dev` group, which is where `torch`, `torchvision` and the ONNX extras live.
+Anything that runs the library needs it — see [Installation](/docs/installation#install-torch-yourself).
+
+<Tabs items={['Tests', 'Lint', 'Types']}>
+<Tab value="Tests">
+```bash
+uv run pytest tests/
+```
+</Tab>
+<Tab value="Lint">
+```bash
+uv run ruff check src/ tests/
+uv run ruff format src/ tests/
+```
+</Tab>
+<Tab value="Types">
+```bash
+uvx ty check src/
+```
+</Tab>
+</Tabs>
+
+All three run in CI on every push and PR to `main`. Python 3.13+ type syntax is expected —
+`list[str]`, `dict[str, Any]`, `X | None`.
+
+## Layout
+
+```
+src/nobg/
+├── __init__.py     # public API — every model class, processor, AutoModel, OnnxModel
+├── auto.py         # tag-based dispatch
+├── mixin.py        # Revised_Mixin, Onnx_Mixin, OnnxModel
+├── utils.py        # predict / cutout / refine_foreground / post_process_alpha_matting
+├── loss.py
+├── metrics.py
+└── <model_name>/
+    ├── image_processing_<model_name>.py
+    └── modeling_<model_name>.py
+tests/
+├── test_<model_name>.py
+├── test_image_processing_<model_name>.py
+└── test_mixin.py   # shared mixin behaviour, including the ONNX round trip
+```
+
+Each model gets its own subdirectory; the module must be `modeling_<name>.py`.
+
+## Adding a model
+
+<Steps>
+
+<Step>
+### Config dataclass
+
+A `@dataclass` named `<ModelName>Config`, in which **every field has a default** so the model is
+instantiable with no arguments. Fields are primitives (`int`, `float`, `str`, `bool`) and simple
+containers (`list`, `tuple`) only — the dataclass *is* the `config.json` schema, and the Hub mixin
+serializes it with no custom code. Validate cross-field constraints in `__post_init__`.
+</Step>
+
+<Step>
+### Model class
+
+```python
+class MyModel(
+    nn.Module,
+    Revised_Mixin,
+    library_name="nobg",
+    repo_url="https://github.com/feyninc/nobg",
+    tags=["nobg", "nobg-mymodel"],
+    model_card_template=model_card_template(
+        class_name="MyModel", default_repo="nobg/mymodel"
+    ),
+):
+    def __init__(self, config: MyModelConfig | None = None):
+        super().__init__()
+        self.config = config or MyModelConfig()
+```
+
+`self.config = config or MyModelConfig()` is the first line after `super().__init__()`, and every layer
+dimension derives from it — no magic numbers. `forward` returns a dict with raw `(B, 1, H, W)`
+`logits`, plus `loss` when `labels` is passed.
+</Step>
+
+<Step>
+### Processor
+
+`src/nobg/<model_name>/image_processing_<model_name>.py`, subclassing
+`transformers.image_processing_backends.TorchvisionBackend`. For a model whose inputs are not images
+alone, subclass the upstream `transformers` processor for that architecture instead, so the tokenizer
+wiring is inherited rather than reimplemented (`Sam3Processor` is the reference case).
+
+Either way it must expose `post_process_alpha_matting`, `refine_foreground` and `cutout`, delegating to
+`utils.py` — the output contract is the same for every model. Defaults live as **class attributes**, not
+in a dataclass: `preprocessor_config.json` is already the serialization schema.
+</Step>
+
+<Step>
+### `predict` / `process` / `default_processor`
+
+The model exposes `predict(processor, image, ...)` delegating to `utils.predict`, and the
+processor-free `process(image, ...)` delegating to `predict` with `default_processor()`. Anything
+`default_processor` cannot read off the config (SAM3's tokenizer) is resolved *there*, not in `process`.
+</Step>
+
+<Step>
+### Register
+
+Export the model and its processor from `src/nobg/__init__.py`, import the class at the top of
+`auto.py`, and append an `elif "<tag>" in tags` branch to `AutoModel.from_pretrained`'s dispatch chain
+before the final `raise`. Add the processor to `PROCESSOR_TYPES`.
+</Step>
+
+<Step>
+### Tests
+
+`tests/test_<model_name>.py` with one `class Test<ModelName>`, plus
+`tests/test_image_processing_<model_name>.py`, plus a class in `tests/test_mixin.py`. Local-only — no
+network calls; `tmp_path` for filesystem work; `@pytest.fixture` with a reduced-size config for
+expensive setup.
+</Step>
+
+</Steps>
+
+### Required test matrix
+
+| Test | Purpose |
+| :--- | :--- |
+| `test_init_default_config` | Default config produces a valid model |
+| `test_init_custom_config` | Custom config is respected |
+| `test_forward` | Output shape is correct |
+| `test_forward_batch` | Batched input works |
+| `test_save_pretrained` | Produces `model.safetensors` + `config.json` |
+| `test_save_pretrained_config_content` | `config.json` matches the config fields exactly |
+| `test_from_pretrained_roundtrip` | Load reconstructs the config and architecture |
+| `test_weights_preserved_after_roundtrip` | Loaded model produces identical outputs |
+
+Plus, in `test_mixin.py`, a **torch-vs-onnxruntime parity assertion on `logits`**. Guard that module
+with `pytest.importorskip` for both `onnxruntime` and `onnxscript`, and export once per module via a
+`tmp_path_factory` fixture — tracing is slow.
+
+## ONNX: two hooks, nothing else
+
+A new model does not implement the export methods. It overrides at most:
+
+- `onnx_dummy_inputs(batch_size)` — only if `forward` needs more than `pixel_values`. Extend the
+  `super()` dict rather than rebuilding it. Leave optional inputs out, since the graph requires every
+  input it declares.
+- `onnx_dynamo` — only if the default exporter fails. Record **which error** forced the override in a
+  comment, as both existing models do.
+
+See [ONNX reference](/docs/reference/onnx).
+
+## Dependencies
+
+Installed with the package: `huggingface_hub>=1.22.0` and `transformers[torch]>=5.5`.
+
+`torch>=2.0` and `torchvision>=0.15.0` are deliberately **not** declared as project dependencies — they
+sit in the `dev` group, so an install picks up whatever build is already in the environment instead of
+resolving one. Module-level imports of them are still fine; they are hard runtime requirements, just
+environment-provided ones.
+
+`onnx`, `onnxruntime` and `onnxscript` are the `nobg[onnx]` extra and must **only** be imported lazily,
+inside the function that needs them, with an `ImportError` message naming the extra. `mixin.py` imports
+none of them at module level.
+
+A model may import sub-components from `transformers`, but the user-facing config is always the nobg
+dataclass. When a `transformers` sub-component needs its own config object, construct it inside
+`__init__` from `self.config`; never store it on `self` or expose it.
+
+## What not to do
+
+- Don't store parameters outside the config dataclass — no loose `__init__` kwargs.
+- Don't use JSON/YAML/TOML for config definition; the dataclass is the schema.
+- Don't add CLI entry points — this is a library-only package.
+- Don't introduce plugin or entry-point discovery; models are registered manually.
+- Don't override `save_pretrained`, `from_pretrained` or their `onnx_*` counterparts. A small
+  `push_to_hub` override to auto-prefix the username is the one allowed exception.
+- Don't add a base class between `Revised_Mixin` and a concrete model. Shared behaviour goes into a
+  mixin that `Revised_Mixin` itself inherits, as `Onnx_Mixin` does.
+- Don't write a custom model card template — use `utils.model_card_template()`.
+
+## Documentation
+
+This site is a [Fumadocs](https://fumadocs.dev) app in the repo's `docs/` directory.
+
+```bash
+cd docs
+npm install
+npm run dev
+```
+
+Pages are MDX under `docs/content/docs/`, and navigation order comes from the `meta.json` beside them.
+Every page has an "Edit on GitHub" link at the bottom that points straight at its source file.
+
+## Pull requests
+
+- Run the full lint, type and test suite before opening one.
+- Keep each PR focused on a single change.
+- Add tests for new functionality.

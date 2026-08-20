@@ -1,0 +1,57 @@
+---
+title: GPU & half precision
+description: Device placement, autocast, and what predict does for you.
+icon: Cpu
+---
+
+## With `predict` / `process`
+
+Move the model; the batch follows. `predict` reads the device and dtype off the model's first
+floating-point parameter and moves the processor's output to match, so there is nothing else to do:
+
+```python
+from nobg import AutoModel
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg").to("cuda")
+model.process("input.jpg").save("output.png")
+```
+
+A half-precision model works the same way:
+
+```python
+import torch
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg").to("cuda", torch.bfloat16)
+model.process("input.jpg").save("output.png")
+```
+
+Integer inputs (SAM3's `input_ids`, `attention_mask`) are moved to the device but keep their dtype.
+`predict` also handles eval mode for you — it calls `model.eval()`, runs under `no_grad`, and restores
+training mode afterwards if the model was in it.
+
+## Manually, with autocast
+
+```python
+model = AutoModel.from_pretrained("feyninc/FeyNobg").eval().to("cuda")
+inputs = processor(image, return_tensors="pt").to("cuda")
+
+with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+    outputs = model(pixel_values=inputs["pixel_values"])
+```
+
+Autocast keeps the weights in float32 and casts per-op, which is usually the safer half-precision
+route than casting the model outright.
+
+## Notes
+
+- **Post-processing is dtype-agnostic.** `post_process_alpha_matting` sigmoids and interpolates in
+  whatever dtype the logits arrive in; `predict` casts the mattes to CPU float32 before compositing.
+- **`refine_foreground` always computes in ≥ float32**, whatever you hand it — its internal divisions
+  overflow in half precision, which shows up as black patches — then casts back to the input dtype.
+  See [Refining edges](/docs/guides/refining-edges).
+- **SAM3 needs an exact input size.** `pixel_values` must be `config.image_size` square regardless of
+  device or dtype; the vision tower's rotary tables are fixed-size buffers.
+- **ONNX exports run on CPU float32 by default.** `OnnxModel` reports no parameters, which is how the
+  shared `predict` reads it as CPU float32 — matching what the session accepts. Install
+  `onnxruntime-gpu` and the loader will pick up the GPU provider. See [ONNX
+  export](/docs/guides/onnx).

@@ -1,0 +1,16 @@
+{
+  "title": "Documentation",
+  "root": true,
+  "pages": [
+    "index",
+    "installation",
+    "quickstart",
+    "models",
+    "---Guides---",
+    "guides",
+    "---Reference---",
+    "reference",
+    "---Project---",
+    "contributing"
+  ]
+}

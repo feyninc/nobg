@@ -1,0 +1,124 @@
+---
+title: Metrics
+description: The evaluation suite — segmentation, boundary and matting metrics, with their costs.
+---
+
+```python
+from nobg import metrics
+```
+
+The metric suite used to benchmark BiRefNet (MAE, S-measure, F/E-measures), the common overlap metrics
+(IoU, Dice, accuracy, BER), boundary IoU, and the alpha-matting metrics from SAMA / ZIM (SAD, MSE,
+gradient error, connectivity error).
+
+<Callout type="warn" title="Probabilities, not logits">
+  Every function takes `pred` in `[0, 1]` and `gt` in `[0, 1]`, both `(B, 1, H, W)`, and returns a
+  scalar tensor averaged over the batch. Applying `sigmoid` to model logits is the caller's job — the
+  same convention as `nobg.loss`.
+</Callout>
+
+```python
+import torch
+from nobg import AutoModel, metrics
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg").eval()
+processor = model.default_processor()
+
+batch = processor(images=images, segmentation_maps=masks, return_tensors="pt")
+with torch.no_grad():
+    pred = model(pixel_values=batch["pixel_values"])["logits"].sigmoid()
+
+print(metrics.mae(pred, batch["labels"]).item())
+print(metrics.boundary_iou(pred, batch["labels"]).item())
+```
+
+## Segmentation metrics
+
+Those taking `threshold` binarize `pred` at it (default 0.5); `gt` is always binarized at 0.5.
+
+| Function | Signature | Better | Notes |
+| :--- | :--- | :---: | :--- |
+| `mae` | `(pred, gt)` | ↓ | Mean absolute error; the headline number in the DIS/SOD literature |
+| `iou_metric` | `(pred, gt, threshold=0.5)` | ↑ | Hard IoU. Distinct from `loss.iou_loss`, which is soft and differentiable |
+| `dice` | `(pred, gt, threshold=0.5)` | ↑ | Dice coefficient |
+| `accuracy` | `(pred, gt, threshold=0.5)` | ↑ | Correctly classified pixel fraction — saturates, use with care |
+| `ber` | `(pred, gt, threshold=0.5)` | ↓ | Balanced error rate: mean of FPR and FNR, so a large background can't hide misses |
+| `f_measure_max` | `(pred, gt, num_thresholds=255)` | ↑ | Best F-measure across thresholds (β² = 0.3) |
+| `f_measure_mean` | `(pred, gt, num_thresholds=255)` | ↑ | Mean F-measure across thresholds |
+| `e_measure_max` | `(pred, gt, num_thresholds=255)` | ↑ | Enhanced-alignment measure, max over thresholds |
+| `e_measure_mean` | `(pred, gt, num_thresholds=255)` | ↑ | Enhanced-alignment measure, mean over thresholds |
+| `s_measure` | `(pred, gt, alpha=0.5)` | ↑ | Structure measure: `α·S_object + (1-α)·S_region` |
+| `weighted_f_measure` | `(pred, gt, beta2=1.0)` | ↑ | Margolin et al., approximate — see below |
+
+The threshold-swept measures are histogram-based, so `num_thresholds` costs almost nothing to raise.
+All of them handle degenerate ground truth (all-background or all-foreground) by falling back to pixel
+agreement rather than dividing by zero.
+
+## Boundary quality
+
+```python
+boundary_iou(pred, gt, threshold=0.5, dilation_ratio=0.02)
+```
+
+Boundary IoU (Cheng et al., CVPR 2021; reported as mBIoU on HQSeg-44K) — IoU computed only over a thin
+band around each contour, so interior agreement cannot mask boundary errors. The band width is
+`round(dilation_ratio × image_diagonal)`, minimum 1, matching the reference implementation; the region
+is `mask XOR erode(mask, width)`, with erosion as min-pooling.
+
+This is the metric to report when models are near-saturated on HRSOD / UHRSD / DAVIS-S, where plain IoU
+and S-measure no longer separate them.
+
+## Matting metrics
+
+These treat both maps as **continuous alpha mattes** and do **not** binarize (except
+`connectivity_error`, which needs components) — the soft values are the point.
+
+| Function | Signature | Better | Notes |
+| :--- | :--- | :---: | :--- |
+| `sad` | `(pred, gt)` | ↓ | Sum of absolute differences, per image then batch-averaged. The literature reports this ÷ 1000; this returns the raw pixel sum |
+| `mse_metric` | `(pred, gt)` | ↓ | Mean squared error — penalizes large errors harder than `mae` |
+| `gradient_error` | `(pred, gt)` | ↓ | L1 difference of Sobel gradient magnitudes; edge quality |
+| `connectivity_error` | `(pred, gt, threshold=0.5)` | ↓ | Penalizes alpha stranded outside the largest connected component |
+
+## Cost
+
+Everything is pure torch — no scipy, no numpy — so it runs on the GPU alongside training. The prices
+differ by orders of magnitude:
+
+| Tier | Functions |
+| :--- | :--- |
+| Cheap, `O(N)` | `mae`, `iou_metric`, `dice`, `accuracy`, `ber`, `sad`, `mse_metric`, `boundary_iou` |
+| Medium, `O(N·T)` | `f_measure_max/mean`, `e_measure_max/mean` (histogram based), `gradient_error` (two separable convolutions) |
+| Expensive | `s_measure`, `weighted_f_measure`, `connectivity_error` |
+
+For per-step training monitoring, stay in the cheap tier; run the expensive three at epoch boundaries or
+on a final eval set.
+
+`connectivity_error` is the most expensive by a wide margin: its connected components come from torch
+label propagation, which needs `O(longest path)` iterations.
+
+<Callout type="warn" title="Three metrics deviate from the reference tools">
+  - `weighted_f_measure` — the official metric weights errors by a Euclidean distance transform on the
+    background. Pure torch has no EDT, so the spatial weighting is approximated with a fixed 7×7
+    Gaussian (σ = 5). Adequate for monitoring; not for a paper table.
+  - `connectivity_error` — components come from torch label propagation rather than scipy labelling, so
+    absolute values differ slightly.
+  - `_connected_components` is bounded at 256 iterations, and that bound really binds: an id has to
+    travel the component's longest path, which is ~840 iterations for a centred disk at 1024², ~3200
+    for a noisy mask. Past the bound a component can stay split across labels, which shows up as a
+    slightly overstated connectivity error. Raising `n_iter` fixes it at proportional cost.
+
+  Everything else matches its reference definition.
+</Callout>
+
+## What to report
+
+| Claim | Metrics |
+| :--- | :--- |
+| "The mask is right" | `mae`, `iou_metric`, `f_measure_max` |
+| "The edges are right" | `boundary_iou`, `gradient_error` |
+| "It works as a matte" | `sad`, `mse_metric`, `connectivity_error` |
+| Comparable to DIS/SOD papers | `mae`, `s_measure`, `f_measure_max`, `e_measure_max`, `weighted_f_measure` |
+
+The full walkthrough, including how to score a directory of images, is in
+[Evaluating a model](/docs/guides/evaluation).

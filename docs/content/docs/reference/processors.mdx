@@ -1,0 +1,149 @@
+---
+title: Processors
+description: BiRefNetImageProcessor, Sam3Processor, and the shared post-processing helpers.
+---
+
+```python
+from nobg import BiRefNetImageProcessor, Sam3Processor
+```
+
+A processor turns images (and for SAM3, prompts) into model inputs, and turns raw logits back into
+alpha mattes and cutouts. Both classes expose the same three post-processing methods, so code written
+against one works against the other.
+
+## `BiRefNetImageProcessor`
+
+A `transformers` `TorchvisionBackend` processor. Preprocessing is: RGB convert → square bilinear resize
+to `size` → rescale to `[0, 1]` → ImageNet normalize.
+
+<TypeTable
+  type={{
+    size: {
+      description: 'Target resolution. Should match the model\'s config.image_size.',
+      type: 'dict',
+      default: '{"height": 1024, "width": 1024}',
+    },
+    resample: { description: 'Resize filter.', type: 'PILImageResampling', default: 'BILINEAR' },
+    image_mean: { description: 'Normalization mean.', type: 'list[float]', default: 'IMAGENET_DEFAULT_MEAN' },
+    image_std: { description: 'Normalization std.', type: 'list[float]', default: 'IMAGENET_DEFAULT_STD' },
+    rescale_factor: { description: 'Applied before normalization.', type: 'float', default: '1 / 255' },
+    do_convert_rgb: { description: 'Drop alpha and palette modes.', type: 'bool', default: 'true' },
+    do_resize: { description: '', type: 'bool', default: 'true' },
+    do_rescale: { description: '', type: 'bool', default: 'true' },
+    do_normalize: { description: '', type: 'bool', default: 'true' },
+    default_to_square: { description: '', type: 'bool', default: 'true' },
+  }}
+/>
+
+Any of these can be overridden per call, which is what `**processor_kwargs` on `process`/`predict`
+forwards:
+
+```python
+processor(images=image, return_tensors="pt", size={"height": 512, "width": 512})
+```
+
+### `segmentation_maps` — labels for training
+
+```python
+batch = processor(images=images, segmentation_maps=masks, return_tensors="pt")
+batch["labels"]  # (B, 1, H, W), float32, hard 0/1
+```
+
+Masks go through the same resize and `[0, 1]` rescale as the images but are **never normalized**, then
+are binarized at 0.5. The channel dimension is kept, because that is the shape `forward(labels=...)`
+expects.
+
+<Callout title="Only BiRefNet's processor builds labels">
+  `Sam3Processor` takes no `segmentation_maps`. Build SAM3 labels yourself — see
+  [Fine-tuning](/docs/guides/fine-tuning#sam3).
+</Callout>
+
+## `Sam3Processor`
+
+Subclasses `transformers`' `Sam3Processor`, so the CLIP tokenizer wiring, box handling and instance
+post-processing are inherited unchanged.
+
+```python
+Sam3Processor(image_processor, tokenizer, target_size=None, point_pad_value=-10,
+              default_prompt="the main foreground subject")
+```
+
+The one behavioural change: `text` defaults to `default_prompt` instead of `None`. SAM3 refuses to run
+without a prompt, so this is what makes `processor(images=image)` behave like
+`BiRefNetImageProcessor`, while any explicit `text=` still gives open-vocabulary cutouts.
+
+```python
+processor(images=image, return_tensors="pt")                       # default prompt
+processor(images=image, text="the dog", return_tensors="pt")        # open vocabulary
+processor(images=image, input_boxes=[[[30, 40, 210, 300]]], return_tensors="pt")
+```
+
+`input_boxes` are pixel-space `[x1, y1, x2, y2]` per image; the processor converts them to the
+normalized `cxcywh` form the model wants and generates `input_boxes_labels`. Nesting rules and the
+shared-prompt semantics are in [Text and box prompts](/docs/guides/text-prompts).
+
+Set `default_prompt` to match the model's `config.default_prompt`; `Sam3.default_processor()` does
+that for you.
+
+## Shared post-processing
+
+Identical on both classes, and on `nobg.utils` as free functions.
+
+### `post_process_alpha_matting`
+
+```python
+post_process_alpha_matting(outputs, target_sizes=None) -> list[Tensor]
+```
+
+Sigmoids the raw `(B, 1, H, W)` logits and returns a list of `(H, W)` tensors in `[0, 1]`, one per
+image. `outputs` may be the output dict or any object with a `.logits` attribute. `target_sizes` is a
+list of `(height, width)` tuples, one per image — each matte is bilinearly resized to its own target,
+which is how a batch of differently-sized inputs comes back at full resolution.
+
+```python
+alphas = processor.post_process_alpha_matting(outputs, target_sizes=[im.size[::-1] for im in images])
+```
+
+<Callout title="Matte logits only">
+  For SAM3 this reads the wrapper's aggregated `logits`, not the per-instance `pred_masks`. Use the
+  inherited `post_process_instance_segmentation` on the image processor for per-object outputs.
+</Callout>
+
+### `refine_foreground`
+
+```python
+refine_foreground(image, alpha, r=90) -> Image | Tensor
+```
+
+Blur-fusion foreground estimation ([arXiv:2006.14970](https://arxiv.org/abs/2006.14970)) — recovers
+unmixed foreground colors so semi-transparent pixels don't carry the old background's color. Accepts and
+returns either a PIL image or a tensor. A static method, so it needs no processor state. See
+[Refining edges](/docs/guides/refining-edges).
+
+### `cutout`
+
+```python
+cutout(image, alpha, refine=False, r=90) -> Image
+```
+
+Composites `alpha` onto `image` as an RGBA PIL image, resizing the matte to the image if needed. With
+`refine=True` it runs `refine_foreground` first.
+
+## `push_to_hub`
+
+Both classes override it to auto-prefix a bare `repo_id` with your Hub username, matching the models:
+
+```python
+processor.push_to_hub("my-matting-model")   # -> your-username/my-matting-model
+```
+
+## Getting the right processor
+
+| You have | Use |
+| :--- | :--- |
+| A model instance | `model.default_processor()` |
+| A Hub repo id | `AutoProcessor.from_pretrained(repo_id)` |
+| Neither, and BiRefNet defaults are fine | `BiRefNetImageProcessor()` |
+
+See [AutoModel & AutoProcessor](/docs/reference/auto) for how dispatch and the config-only fallback
+work.

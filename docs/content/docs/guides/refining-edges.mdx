@@ -1,0 +1,80 @@
+---
+title: Refining edges
+description: Remove the halo of the old background from soft, semi-transparent pixels.
+icon: Sparkles
+---
+
+A soft matte leaves the old background mixed into every semi-transparent pixel, so compositing the
+*original* pixels onto a new background shows a halo of the old one — most visible on hair, fur and
+motion blur.
+
+`refine_foreground` solves for the foreground color those pixels would have had, using the
+blur-fusion estimator of [Approximate Fast Foreground Colour
+Estimation](https://arxiv.org/abs/2006.14970) (two passes, coarse then fine).
+
+## In `cutout`
+
+```python
+processor.cutout(image, alpha, refine=True).save("output.png")
+```
+
+That is the whole feature: the image's colors are replaced with the estimate before the alpha channel
+is attached.
+
+## Standalone
+
+It is pure torch, so it runs wherever its inputs live — keep the tensors on the GPU and the
+refinement stays there too:
+
+```python
+alpha = processor.post_process_alpha_matting(
+    outputs, target_sizes=[(image.height, image.width)]
+)[0]
+foreground = processor.refine_foreground(pixel_tensor.cuda(), alpha.cuda())
+```
+
+<TypeTable
+  type={{
+    image: {
+      description: 'The original image: a PIL image, or a float tensor in [0, 1] of shape (3, H, W) or (B, 3, H, W).',
+      type: 'Tensor | Image',
+      required: true,
+    },
+    alpha: {
+      description: 'The matte: a PIL image, or a tensor in [0, 1] of shape (H, W), (1, H, W) or (B, 1, H, W). Bilinearly resized to the image if the two disagree.',
+      type: 'Tensor | Image',
+      required: true,
+    },
+    r: {
+      description: 'Radius of the coarse blur — how far the estimator reaches for a color to borrow. Cost grows about linearly with it.',
+      type: 'int',
+      default: '90',
+    },
+  }}
+/>
+
+The return type matches `image`: a PIL image in, a PIL image out; a batched tensor in, a batched
+tensor out, with the input dtype and device preserved. The estimate itself is always computed in at
+least float32 — the divisions inside overflow in half precision, which shows up as black patches.
+
+## Choosing `r`
+
+`r` is the coarse blur radius, and the default of `90` is tuned for the resolutions these models run
+at. Larger reaches further for a color to borrow (better on wide, wispy edges) at a roughly linear
+cost; the second, fine pass always uses a fixed radius of 6.
+
+<Callout title="Cost">
+  The blur is separable — two 1-D average pools rather than one `r²` window — so refinement is
+  `O(r)` per pixel, not `O(r²)`. At the default `r=90` that is an order of magnitude cheaper than the
+  naive form, but it is still a full extra pass over the image.
+</Callout>
+
+## When it matters
+
+| Situation | Refine? |
+| :--- | :--- |
+| Compositing onto a new background | Yes — this is the case it exists for |
+| Hair, fur, feathers, motion blur | Yes, most visible here |
+| Saving an RGBA cutout for later use | Yes, the halo is baked into the file otherwise |
+| Using the matte as a hard mask | No, the color estimate is irrelevant |
+| Near-binary mattes (crisp product shots) | Barely any difference |

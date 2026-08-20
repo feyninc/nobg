@@ -1,0 +1,122 @@
+---
+title: Quickstart
+description: From a photo to a cutout in three lines, then the pieces underneath.
+icon: Rocket
+---
+
+## Three lines
+
+```python
+from nobg import AutoModel
+
+model = AutoModel.from_pretrained("feyninc/FeyNobg")
+model.process("input.jpg").save("output.png")
+```
+
+`process` runs the whole pipeline — load, preprocess, forward under `no_grad` in eval mode,
+post-process, composite — and builds the processor the model's own config implies, so there is
+nothing else to load. The result is an RGBA `PIL.Image` at the input's original resolution.
+
+`image` takes anything [`loadimg`](https://github.com/not-lain/loadimg) accepts: a path, a URL, a
+base64 string, a numpy array or a PIL image.
+
+## Several images
+
+Pass a list, get a list back — each matte at its own original resolution:
+
+```python
+for cut, path in zip(model.process(["a.jpg", "b.jpg"]), ("a.png", "b.png")):
+    cut.save(path)
+```
+
+Useful keywords:
+
+<TypeTable
+  type={{
+    batch_size: {
+      description: 'Images per forward pass. The default keeps peak memory flat; raise it for throughput.',
+      type: 'int',
+      default: '1',
+    },
+    return_type: {
+      description: '"cutout" for RGBA images, "alpha" for the raw (H, W) matte tensors in [0, 1].',
+      type: '"cutout" | "alpha"',
+      default: '"cutout"',
+    },
+    '**processor_kwargs': {
+      description: 'Anything left over is forwarded to the processor.',
+      type: 'Any',
+    },
+  }}
+/>
+
+```python
+alpha = model.process("input.jpg", return_type="alpha")  # (H, W) tensor in [0, 1]
+```
+
+## With an explicit processor
+
+`predict` is the same call with the processor passed in. Reach for it when you already have one, or
+when a checkpoint's `preprocessor_config.json` disagrees with its `config.image_size` — `process`
+trusts the model config.
+
+```python
+from nobg import AutoProcessor
+
+processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
+model.predict(processor, "input.jpg").save("output.png")
+```
+
+The processor comes first, then the inputs that vary: `predict(processor, image, prompt, boxes)`,
+each optional after `image`. BiRefNet takes neither `prompt` nor `boxes`; [SAM3 takes
+both](/docs/guides/text-prompts). `model.default_processor()` returns the one `process` would build,
+if you want it without the Hub round-trip.
+
+## Driving the steps yourself
+
+When you need the intermediates — the matte before compositing, the model outputs, the tensors on a
+particular device:
+
+```python
+import torch
+from loadimg import load_img
+
+image = load_img("input.jpg").convert("RGB")
+inputs = processor(image, return_tensors="pt")
+
+with torch.no_grad():
+    outputs = model(pixel_values=inputs["pixel_values"])
+
+alpha = processor.post_process_alpha_matting(
+    outputs, target_sizes=[(image.height, image.width)]
+)[0]
+processor.cutout(image, alpha).save("output.png")
+```
+
+`post_process_alpha_matting` takes one `(height, width)` per image, so a batch comes back at each
+image's original resolution. See [Batched inference](/docs/guides/batched-inference).
+
+## Text-promptable cutouts
+
+FeyNobg finds *the* foreground subject. MultiMatte lets you say which one:
+
+```python
+from nobg import AutoModel
+
+model = AutoModel.from_pretrained("feyninc/multimatte")
+model.process("input.jpg", "the dog").save("dog.png")
+```
+
+With no prompt it falls back to `"the main foreground subject"`, which is what makes prompt-free
+background removal work. See [Text and box prompts](/docs/guides/text-prompts).
+
+## Next steps
+
+<Cards>
+  <Card title="Model zoo" href="/docs/models" description="Which checkpoint to reach for." />
+  <Card title="Refining edges" href="/docs/guides/refining-edges" description="Remove the halo of the old background." />
+  <Card title="GPU & precision" href="/docs/guides/gpu-and-precision" description="Half precision and device placement." />
+  <Card title="Fine-tuning" href="/docs/guides/fine-tuning" description="Train on your own data." />
+</Cards>
+
+Or try it in the browser first: [🤗 FeyNobg Space](https://huggingface.co/spaces/feyninc/feynobg).
