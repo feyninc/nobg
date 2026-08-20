@@ -16,8 +16,8 @@ The contract is small:
 ## BiRefNet
 
 ```python
-from transformers import Trainer, TrainingArguments
 from nobg import AutoModel, AutoProcessor
+from transformers import Trainer, TrainingArguments
 
 model = AutoModel.from_pretrained("feyninc/FeyNobg")
 processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
@@ -25,21 +25,32 @@ processor = AutoProcessor.from_pretrained("feyninc/FeyNobg")
 
 def collate(examples):
     batch = processor(
-        images=[ex["image"] for ex in examples],
-        segmentation_maps=[ex["mask"].convert("L") for ex in examples],
+        images=[example["image"] for example in examples],
+        segmentation_maps=[
+            example["mask"].convert("L") for example in examples
+        ],
         return_tensors="pt",
     )
-    return {"pixel_values": batch["pixel_values"], "labels": batch["labels"]}
+    return {
+        "pixel_values": batch["pixel_values"],
+        "labels": batch["labels"],
+    }
 
 
 trainer = Trainer(
     model=model,
-    args=TrainingArguments(output_dir="outputs", learning_rate=2e-5),
+    args=TrainingArguments(
+        output_dir="outputs",
+        learning_rate=2e-5,
+    ),
     train_dataset=dataset,
     data_collator=collate,
 )
 trainer.train()
 ```
+
+`dataset` is any `torch.utils.data.Dataset` or `datasets.Dataset` whose items carry an `image` and a
+`mask` — the collator is what adapts your field names, so nothing else has to change.
 
 `segmentation_maps` are resized and rescaled like the images but never normalized, then binarized at
 0.5 — BiRefNet trains against a hard mask even though it predicts a soft one. The channel dimension is
@@ -74,14 +85,7 @@ logits at possibly differing resolutions and `gt` is `(B, 1, H, W)` in `[0, 1]`.
 
 ## SAM3
 
-Start from MultiMatte, and take the processor from the same repo so the tokenizer matches:
-
-```python
-from nobg import AutoModel, AutoProcessor
-
-model = AutoModel.from_pretrained("feyninc/multimatte")
-processor = AutoProcessor.from_pretrained("feyninc/multimatte")
-```
+Start from MultiMatte, and take the processor from the same repo so the tokenizer matches.
 
 `Sam3.forward` takes `labels` the same way and defaults to `sam3_loss` — SAM 3's own
 semantic-segmentation objective, weighted focal (×20, `alpha=0.6`) + dice (×30) — so fine-tuning
@@ -98,24 +102,31 @@ Two differences from BiRefNet:
 ```python
 import torch
 import torch.nn.functional as F
+from nobg import AutoModel, AutoProcessor
+from transformers import Trainer, TrainingArguments
+
+model = AutoModel.from_pretrained("feyninc/multimatte")
+processor = AutoProcessor.from_pretrained("feyninc/multimatte")
+
+size = model.config.image_size
 
 
 def collate(examples):
-    size = model.config.image_size
     batch = processor(
-        images=[ex["image"] for ex in examples],
+        images=[example["image"] for example in examples],
         text="the main foreground subject",
         return_tensors="pt",
     )
     masks = torch.stack(
         [
             F.interpolate(
-                torch.as_tensor(ex["mask"], dtype=torch.float32)[None, None] / 255,
+                torch.as_tensor(example["mask"], dtype=torch.float32)[None, None]
+                / 255,
                 size=(size, size),
                 mode="bilinear",
                 align_corners=False,
             )[0]
-            for ex in examples
+            for example in examples
         ]
     )
     return {
@@ -124,6 +135,18 @@ def collate(examples):
         "attention_mask": batch["attention_mask"],
         "labels": masks,
     }
+
+
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(
+        output_dir="outputs",
+        learning_rate=2e-5,
+    ),
+    train_dataset=dataset,
+    data_collator=collate,
+)
+trainer.train()
 ```
 
 <Callout title="What sam3_loss deliberately leaves out">
