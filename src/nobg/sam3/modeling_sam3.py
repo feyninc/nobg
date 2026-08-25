@@ -124,7 +124,7 @@ class Sam3(
     repo_url="https://github.com/feyninc/nobg",
     paper_url="https://ai.meta.com/research/publications/sam-3-segment-anything-with-concepts/",
     license="apache-2.0",
-    tags=["nobg", "nobg-sam3","promptable","bbox"],
+    tags=["nobg", "nobg-sam3", "promptable", "bbox"],
     model_card_template=model_card_template(
         class_name="Sam3",
         default_repo="nobg/sam3",
