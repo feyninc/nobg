@@ -1,0 +1,18 @@
+[project]
+name = "nobg"
+version = "0.1.0"
+description = "NoBG background removal and foreground refinement nodes for ComfyUI"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+# 0.3.1 does not ship nobg.comfyui.nodes. Publish and verify the 0.3.2
+# PyPI wheel with that module before publishing this Registry version.
+dependencies = ["nobg>=0.3.2"]
+
+[project.urls]
+Repository = "https://github.com/feyninc/nobg"
+Documentation = "https://github.com/feyninc/nobg/tree/main/comfyui"
+
+[tool.comfy]
+PublisherId = "chonk-lain"
+DisplayName = "NoBG"

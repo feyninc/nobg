@@ -20,7 +20,7 @@
 
 | Input | Output |
 |:-----:|:------:|
-| <img src="https://raw.githubusercontent.com/feyninc/nobg/main/assets/feyn_mark.png" width="320"> | <img src="https://raw.githubusercontent.com/feyninc/nobg/main/assets/feyn_mark_cutout.png" width="320"> |
+| <img src="https://raw.githubusercontent.com/feyninc/nobg/main/assets/dog_input.png" alt="Dog in the original photo" width="320"> | <img src="https://raw.githubusercontent.com/feyninc/nobg/main/assets/dog_cutout.png" alt="Illustrative dog cutout on a transparent background" width="320"> |
 
 </div>
 
@@ -30,6 +30,7 @@
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Model Zoo](#model-zoo)
+- [ComfyUI integration](#comfyui-integration)
 - [Usage](#usage)
   - [AutoModel & AutoProcessor](#automodel--autoprocessor)
   - [SAM3: text-promptable cutouts](#sam3-text-promptable-cutouts)
@@ -140,6 +141,100 @@ Or try it in the browser first: **[🤗 FeyNobg Space](https://huggingface.co/sp
 |:------|:-----|:------:|:----------:|:-----|:------|
 | **FeyNobg** | [`feyninc/FeyNobg`](https://huggingface.co/feyninc/FeyNobg) | 0.3 B | 1024 × 1024 | Background removal / matting | Strongest published model, start here |
 | **SAM3** | [`facebook/sam3`](https://huggingface.co/facebook/sam3) | 0.84 B | 1008 × 1008 | Background removal + text-promptable segmentation | Load with `Sam3.from_origin`. Picks the subject well; edges stay softer than FeyNobg. Gated; weights are under Meta's [SAM License](https://huggingface.co/facebook/sam3/blob/main/LICENSE) |
+
+## ComfyUI integration
+
+The separate [NoBG Comfy Registry pack](https://registry.comfy.org/publishers/chonk-lain/nodes/nobg)
+is released independently of the PyPI library. The first Registry release
+(0.1.0) depends on a **published** `nobg>=0.3.2` wheel containing
+`nobg.comfyui.nodes`; PyPI `nobg` 0.3.1 does not include the integration.
+The Registry release must wait until that library wheel is published.
+
+For a published release, install the [NoBG Registry pack](https://registry.comfy.org/publishers/chonk-lain/nodes/nobg)
+through ComfyUI Manager and restart ComfyUI. The pack installs the `nobg`
+library but no model weights. The first Registry version (0.1.0) requires a
+published PyPI `nobg>=0.3.2` wheel; Registry and PyPI version numbers are
+independent.
+
+For development from a source checkout, use **ComfyUI's Python environment**
+(replace `python` below with the Python executable ComfyUI uses), install the
+library, then link the entrypoint and restart ComfyUI:
+
+```bash
+python -m pip install -e /path/to/nobg
+ln -s /path/to/nobg/comfyui /path/to/ComfyUI/custom_nodes/nobg
+```
+
+The entrypoint registers **NoBG Model Loader**, **NoBG Remove Background**
+and **NoBG Refine Foreground**. In the loader, choose `feyninc/FeyNobg`
+(default) or `facebook/sam3`; the Hub preset downloads weights on first use
+and caches them. Alternatively, for offline use, put a checkpoint in
+`ComfyUI/models/nobg/<name>/config.json` and
+`ComfyUI/models/nobg/<name>/model.safetensors`, restart ComfyUI, then select
+`local: <name>`. Other ComfyUI `nobg` model search paths are also scanned.
+Local architecture is read from `config.json`, not guessed from the folder
+name. For offline SAM3, include tokenizer files in the local checkpoint
+directory or pre-cache the fallback `openai/clip-vit-large-patch14` tokenizer
+while online. To use a gated upstream `facebook/sam3` snapshot offline, first
+download its `config.json` and `model.safetensors` with approved Hub access;
+the upstream config/weights differ from nobg-format SAM3 checkpoints.
+
+For `facebook/sam3`, request/accept access on its
+[gated Hub page](https://huggingface.co/facebook/sam3), then authenticate
+**in ComfyUI's environment** before starting ComfyUI: use `hf auth login`
+with an authorized token, or set `HF_TOKEN` in the process environment.
+The removal node has a `prompt` text widget: enter a description such as
+`the dog` to select a subject with SAM3, or leave it empty to use SAM3's
+default prompt. BiRefNet ignores prompts.
+SAM3 weights are subject to Meta's [SAM License](https://huggingface.co/facebook/sam3/blob/main/LICENSE).
+
+Connect **Load Image → NoBG Remove Background** (`image`) and **NoBG Model
+Loader → NoBG Remove Background** (`nobg_model`), then connect `cutout`
+directly to **Save Image** for a transparent PNG. The removal node accepts
+image batches and returns an RGBA `cutout`, RGB `foreground`, and a foreground
+alpha `mask` (1 = keep/opaque, 0 = background/transparent). ComfyUI's
+**Load Image** mask is *inverted* from alpha (1 = transparent region); invert
+that mask before using it as NoBG's foreground mask. For soft edges, enable
+`refine_foreground` or pass the original RGB image and NoBG `mask` to **NoBG
+Refine Foreground**, then save its `cutout`. The removal node's `batch_size`
+input processes 1–16 images per inference pass (default 1); increase it for
+throughput if memory allows. CPU inference and refinement can be slow.
+Sample workflows are in [`comfyui/example_workflows/`](comfyui/example_workflows/).
+Their thumbnails preview a dog cutout, but the workflow JSON does not include that
+photo. After opening a template, select or upload your own image in **Load Image**:
+the referenced `example.png` is only a placeholder, not an included input.
+The SAM3 template additionally requires approved Hub access and authentication
+as described above.
+Direct Python calls to `NoBGRemoveBackground.remove(...)` also accept `boxes`
+and `score_threshold`; these are **not** ComfyUI inputs. The UI exposes
+the SAM3 text-prompt widget and `batch_size` input, but not visual boxes.
+
+ComfyUI is **not** a dependency of the regular `nobg` Python package; the node
+module loads only through the ComfyUI entrypoint. If you already have
+`ComfyUI-NoBG` installed, remove or disable that node pack before enabling this
+one to avoid duplicate node names. Installing only the `nobg` wheel does not
+register nodes: ComfyUI must see `custom_nodes/nobg/__init__.py`.
+
+Registry metadata, licensing, release notes and the entrypoint live in
+[`comfyui/`](comfyui/). To release a new Registry version, increment
+`comfyui/pyproject.toml` and add a nonempty matching section to
+`comfyui/CHANGELOG.md`. Run the **Publish NoBG to Comfy Registry** manual
+workflow only after the required PyPI wheel is live. It checks lint, types,
+tests, the published wheel and the tracked-only snapshot and archive before
+publishing from `comfyui/`. It then reads back the Registry version changelog.
+If the Registry reports a pending security scan, run the same
+workflow with `verify_only` after the scan; flagged/banned versions require
+investigation. It uses the `REGISTRY_ACCESS_TOKEN` repository secret and does
+not invoke the root PyPI publishing workflow.
+`comfy-cli==1.26.0` repacks the archive when publishing; Ruff runs with
+`RUFF_NO_CACHE=true`, and generated `.ruff_cache`/`__pycache__` files are ignored
+by the snapshot audit (never included in its tracked-file archive). Before
+publishing, the workflow verifies archive members byte-for-byte against the
+staged snapshot; afterward, it verifies the repacked members. This does not
+prove the inspected ZIP's exact bytes were uploaded or rule out changes inside
+the CLI between repack and upload. The token is supplied through the CLI's
+hidden stdin prompt, not in command arguments; avoid untrusted processes on
+the release runner.
 
 ## Usage
 

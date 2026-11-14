@@ -1,0 +1,9 @@
+# Registry release notes
+
+## 0.1.0
+
+Initial NoBG ComfyUI Registry release: model loader, background removal with
+optional SAM3 text prompt and foreground refinement, and a separate foreground
+refinement node. The entrypoint delegates to the separately installed `nobg`
+PyPI package. Legacy Python callers can pass boxes to `remove(...)`, but boxes
+are not exposed as a ComfyUI input.

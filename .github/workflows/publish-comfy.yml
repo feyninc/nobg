@@ -1,0 +1,124 @@
+name: Publish NoBG to Comfy Registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      verify_only:
+        description: "Recheck an already published version after the Registry scan"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify published Registry status
+        if: inputs.verify_only
+        working-directory: comfyui
+        run: python release.py verify
+
+      - name: Gate on lint, type checks and local tests
+        if: ${{ !inputs.verify_only }}
+        run: |
+          uv sync --group dev
+          uv run ruff check src/ tests/ comfyui/release.py
+          uv run ruff format --check src/ tests/ comfyui/release.py
+          uv run ty check src/
+          uv run pytest tests/ -q
+
+      # Work only with committed files under comfyui/. The temporary git index
+      # lets comfy-cli pack only those files and apply .comfyignore. The
+      # release script checks archive bytes against this snapshot before publish.
+      - name: Prepare tracked-only Registry snapshot
+        if: ${{ !inputs.verify_only }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/nobg-registry"
+          git archive HEAD:comfyui | tar -x -C "$RUNNER_TEMP/nobg-registry"
+          # Fail closed if committed cache files ever enter this archive.
+          test ! -e "$RUNNER_TEMP/nobg-registry/.ruff_cache"
+          git -C "$RUNNER_TEMP/nobg-registry" init -q
+          git -C "$RUNNER_TEMP/nobg-registry" add --all
+
+      - name: Require published PyPI integration wheel and release notes
+        if: ${{ !inputs.verify_only }}
+        working-directory: ${{ runner.temp }}/nobg-registry
+        run: python release.py preflight
+
+      - name: Smoke-test Registry entrypoint against published wheel
+        if: ${{ !inputs.verify_only }}
+        working-directory: ${{ runner.temp }}/nobg-registry
+        run: |
+          python -m venv "$RUNNER_TEMP/nobg-registry-smoke"
+          NOBG_VERSION="$(python -c 'import release; from pathlib import Path; print(next(dep.removeprefix("nobg>=") for dep in release.metadata(Path.cwd())["dependencies"] if dep.startswith("nobg>=")))')"
+          "$RUNNER_TEMP/nobg-registry-smoke/bin/python" -m pip install --only-binary=nobg "nobg==$NOBG_VERSION"
+          "$RUNNER_TEMP/nobg-registry-smoke/bin/python" - <<'PY'
+          import importlib.util
+          import sys
+          import types
+          from pathlib import Path
+
+          import nobg
+          import nobg.comfyui
+
+          assert Path(nobg.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+          assert Path(nobg.comfyui.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+
+          folder_paths = types.ModuleType("folder_paths")
+          folder_paths.models_dir = str(Path(sys.prefix) / "models")
+          folder_paths.add_model_folder_path = lambda *args: None
+          folder_paths.get_folder_paths = lambda *args: []
+          sys.modules["folder_paths"] = folder_paths
+
+          comfy = types.ModuleType("comfy")
+          comfy.__path__ = []
+          comfy.model_management = types.ModuleType("comfy.model_management")
+          comfy.utils = types.ModuleType("comfy.utils")
+          sys.modules["comfy"] = comfy
+          sys.modules["comfy.model_management"] = comfy.model_management
+          sys.modules["comfy.utils"] = comfy.utils
+
+          spec = importlib.util.spec_from_file_location(
+              "nobg_registry_smoke", Path.cwd() / "__init__.py"
+          )
+          assert spec and spec.loader
+          entrypoint = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(entrypoint)
+          assert entrypoint.NODE_CLASS_MAPPINGS
+          assert set(entrypoint.NODE_CLASS_MAPPINGS) == set(
+              entrypoint.NODE_DISPLAY_NAME_MAPPINGS
+          )
+          PY
+
+      - name: Install Registry packer and inspect installable archive
+        if: ${{ !inputs.verify_only }}
+        working-directory: ${{ runner.temp }}/nobg-registry
+        env:
+          RUFF_NO_CACHE: "true"
+        run: |
+          python -m pip install comfy-cli==1.26.0
+          comfy --skip-prompt --no-enable-telemetry node validate
+          comfy --skip-prompt --no-enable-telemetry node pack
+          python release.py inspect
+
+      - name: Require Registry access token
+        if: ${{ !inputs.verify_only }}
+        env:
+          REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        run: test -n "$REGISTRY_ACCESS_TOKEN"
+
+      - name: Publish from the inspected subdirectory and verify changelog
+        if: ${{ !inputs.verify_only }}
+        working-directory: ${{ runner.temp }}/nobg-registry
+        env:
+          REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+          RUFF_NO_CACHE: "true"
+        run: python release.py publish
