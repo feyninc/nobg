@@ -55,7 +55,7 @@ class BiRefNetImageProcessor(TorchvisionBackend):
     ) -> BatchFeature:
         return super().preprocess(images, segmentation_maps, **kwargs)
 
-    def _preprocess_image_like_inputs(  # ty: ignore[invalid-method-override]
+    def _preprocess_image_like_inputs(  # ty: ignore
         self,
         images: ImageInput,
         segmentation_maps: ImageInput | None,

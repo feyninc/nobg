@@ -12,9 +12,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-import comfy.model_management as mm  # ty: ignore[unresolved-import]
-import comfy.utils  # ty: ignore[unresolved-import]
-import folder_paths  # ty: ignore[unresolved-import]
+import comfy.model_management as mm  # ty: ignore
+import comfy.utils  # ty: ignore
+import folder_paths  # ty: ignore
 import torch
 
 logger = logging.getLogger("ComfyUI-NoBG")
