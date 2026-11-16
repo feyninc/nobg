@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import Image from 'next/image';
 import { DynamicCodeBlock } from 'fumadocs-ui/components/dynamic-codeblock';
 import { links } from '@/lib/shared';
 
@@ -81,21 +82,34 @@ export default function HomePage() {
 
         <div className="grid gap-4 sm:grid-cols-2">
           <figure className="flex flex-col gap-2 rounded-xl border bg-fd-card p-4">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src="https://raw.githubusercontent.com/feyninc/nobg/main/assets/feyn_mark.png"
-              alt="Input photo with its original background"
-              className="rounded-lg"
+            <Image
+              src="/dog_input.png"
+              alt="Dog in a garden before background removal"
+              width={1448}
+              height={1086}
+              className="aspect-4/3 w-full rounded-lg object-contain"
             />
             <figcaption className="text-xs text-fd-muted-foreground">input.jpg</figcaption>
           </figure>
           <figure className="flex flex-col gap-2 rounded-xl border bg-fd-card p-4">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src="https://raw.githubusercontent.com/feyninc/nobg/main/assets/feyn_mark_cutout.png"
-              alt="The same photo with its background removed"
-              className="rounded-lg"
-            />
+            <div
+              className="aspect-4/3 overflow-hidden rounded-lg"
+              style={{
+                backgroundColor: '#fff',
+                backgroundImage:
+                  'linear-gradient(45deg, #d1d5db 25%, transparent 25%), linear-gradient(-45deg, #d1d5db 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #d1d5db 75%), linear-gradient(-45deg, transparent 75%, #d1d5db 75%)',
+                backgroundSize: '24px 24px',
+                backgroundPosition: '0 0, 0 12px, 12px -12px, -12px 0',
+              }}
+            >
+              <Image
+                src="/dog_cutout.png"
+                alt="The same dog cut out from its background"
+                width={1448}
+                height={1086}
+                className="h-full w-full object-contain"
+              />
+            </div>
             <figcaption className="text-xs text-fd-muted-foreground">output.png</figcaption>
           </figure>
         </div>

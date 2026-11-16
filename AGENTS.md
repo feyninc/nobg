@@ -232,6 +232,42 @@ Optional extras (never imported at module level — see ONNX Export):
 
 Models may import sub-components from `transformers` but must wrap them behind the nobg config dataclass — the user-facing config is always the nobg `@dataclass`, never a transformers config object directly. When a transformers sub-component requires its own config object (e.g., `GPT2Config`), construct that config object inside `__init__` from `self.config` fields; it must never be stored on `self` or exposed publicly. Example: `gpt2_cfg = GPT2Config(n_embd=self.config.hidden_size, n_layer=self.config.num_layers); self.block = GPT2Block(gpt2_cfg)`.
 
+## Optional ComfyUI Integration and Registry Releases
+
+- `src/nobg/comfyui/nodes.py` is optional core-package integration code; import it only
+  when running under ComfyUI. Neither `src/nobg/__init__.py` nor other normal core-package
+  imports may import ComfyUI or require ComfyUI to be installed.
+- `comfyui/` is the separate ComfyUI entrypoint/distribution (not `comfyui_nobg/`).
+  Its own `pyproject.toml` has `[project] name = "nobg"` and `[tool.comfy]` with
+  `PublisherId = "chonk-lain"` and `DisplayName = "NoBG"`. It depends on the PyPI
+  `nobg` package containing the integration rather than duplicating model code.
+  The root `pyproject.toml` and `.github/workflows/publish.yml` remain the PyPI
+  package/release path; do not include the entrypoint in the root distribution.
+- The Registry identity is
+  `https://registry.comfy.org/publishers/chonk-lain/nodes/nobg`. Keep the scoped
+  publisher and node ID immutable for this listing; `comfyui-nobg` is a distinct,
+  older listing, not an alias or a target to overwrite.
+- Build the Registry archive from **tracked files** for `comfyui/`, never from an
+  unfiltered working directory (which may contain caches, secrets, or untracked files).
+  Inspect the archive contents and metadata against the snapshot before upload;
+  reject duplicate, nonregular or symlink ZIP members and byte mismatches. The
+  pinned comfy-cli 1.26.0 repacks on publish: verify the repacked members after
+  upload, but never claim the inspected ZIP bytes are exactly what was uploaded.
+  Run CLI validation with `RUFF_NO_CACHE=1`; ignore only known tool cache paths
+  when auditing the staged snapshot, and never include them in its ZIP.
+  Pass the Registry token via comfy-cli's hidden stdin prompt, never argv; the
+  release runner and subprocess still have access to the token.
+- Gate releases on the existing lint, type-check, and local test suite, plus
+  ComfyUI node/entrypoint tests and an entrypoint-only archive smoke check (a
+  stubbed module does not verify installation of the published wheel). Maintain separate
+  PyPI and Registry versions and release changelog entries; verify that the actual
+  Registry release displays its intended changelog text, not merely the
+  `project.description` metadata.
+- Publish the first PyPI `nobg` version containing the integration before any
+  Registry release that depends on it; pin the entrypoint's minimum `nobg` dependency
+  to at least that published version. Do not commit or publish either release without
+  explicit user consent.
+
 ## What NOT to Do
 
 - Do not store parameters outside the config dataclass (no loose `__init__` kwargs).

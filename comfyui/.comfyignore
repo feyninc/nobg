@@ -1,0 +1,6 @@
+# Keep development-only artifacts out of the Registry archive. The example
+# workflows stay included so ComfyUI's template browser can discover them.
+__pycache__/
+*.pyc
+release.py
+CHANGELOG.md
