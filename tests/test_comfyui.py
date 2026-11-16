@@ -648,8 +648,9 @@ def test_sam3_origin_for_upstream_snapshot_and_pretrained_for_nobg(
     )
     nodes._load("sam3", str(upstream), "max")
     origin.assert_called_once_with(str(upstream), aggregate="max")
-    nodes._load("sam3", str(nobg_checkpoint), "semantic")
+    loaded = nodes._load("sam3", str(nobg_checkpoint), "semantic")
     pretrained.assert_called_once_with(str(nobg_checkpoint))
+    assert loaded._tokenizer_source == str(nobg_checkpoint)
 
     snapshot = mock.Mock(return_value=str(upstream))
     monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot)
