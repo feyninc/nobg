@@ -139,15 +139,27 @@ def _download_metadata(source: str) -> tuple[str, str, str, str]:
 
 @contextmanager
 def _download_lock(path: Path):
-    # flock serializes competing downloads to the same final directory on Linux.
-    import fcntl
-
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    # Serializes competing downloads to the same final directory: flock on
+    # POSIX, msvcrt on Windows (no fcntl or O_NOFOLLOW, hence the check).
+    if path.is_symlink():
+        raise ValueError("download lock must not be a symlink")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # raises after ~10 s of waiting
+            try:
+                yield
+            finally:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -483,7 +495,9 @@ def _load(
             )
         if upstream_sam3:
             return Sam3.from_origin(source, aggregate=sam3_aggregate)
-        return Sam3.from_pretrained(source)
+        model = Sam3.from_pretrained(source)
+        model._tokenizer_source = source  # find tokenizer files beside the weights
+        return model
     raise ValueError(f"unknown nobg architecture {architecture!r}")
 
 
