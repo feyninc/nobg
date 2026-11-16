@@ -59,7 +59,7 @@ jobs:
         run: |
           python -m venv "$RUNNER_TEMP/nobg-registry-smoke"
           NOBG_VERSION="$(python -c 'import release; from pathlib import Path; print(next(dep.removeprefix("nobg>=") for dep in release.metadata(Path.cwd())["dependencies"] if dep.startswith("nobg>=")))')"
-          "$RUNNER_TEMP/nobg-registry-smoke/bin/python" -m pip install --only-binary=nobg "nobg==$NOBG_VERSION"
+          "$RUNNER_TEMP/nobg-registry-smoke/bin/python" -m pip install --only-binary=nobg "nobg==$NOBG_VERSION" torch torchvision
           "$RUNNER_TEMP/nobg-registry-smoke/bin/python" - <<'PY'
           import importlib.util
           import sys
