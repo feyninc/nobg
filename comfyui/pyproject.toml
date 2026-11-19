@@ -1,6 +1,6 @@
 [project]
 name = "nobg"
-version = "0.1.0"
+version = "0.1.1"
 description = "NoBG background removal and foreground refinement nodes for ComfyUI"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -16,3 +16,4 @@ Documentation = "https://github.com/feyninc/nobg/tree/main/comfyui"
 [tool.comfy]
 PublisherId = "chonk-lain"
 DisplayName = "NoBG"
+Icon = "https://raw.githubusercontent.com/feyninc/nobg/main/assets/nobg-logo.png"
