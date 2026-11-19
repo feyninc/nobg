@@ -1,5 +1,9 @@
 # Registry release notes
 
+## 0.1.1
+
+Add the NoBG logo as the Registry node icon. No node changes.
+
 ## 0.1.0
 
 Initial NoBG ComfyUI Registry release: model loader, background removal with
