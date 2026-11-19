@@ -1,0 +1,89 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "nobg",
+  "description": "Open-source background removal and image matting: models, processors, losses and metrics behind one small API, with the HuggingFace Hub on both ends.",
+  "colors": {
+    "primary": "#4D7C0F",
+    "light": "#84CC16",
+    "dark": "#4D7C0F"
+  },
+  "icons": {
+    "library": "lucide"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "pages": [
+          "index",
+          "installation",
+          "quickstart",
+          "models"
+        ]
+      },
+      {
+        "group": "Guides",
+        "pages": [
+          "guides/background-removal",
+          "guides/text-prompts",
+          "guides/batched-inference",
+          "guides/refining-edges",
+          "guides/gpu-and-precision",
+          "guides/fine-tuning",
+          "guides/evaluation",
+          "guides/hub",
+          "guides/onnx"
+        ]
+      },
+      {
+        "group": "API reference",
+        "pages": [
+          "reference/auto",
+          "reference/birefnet",
+          "reference/sam3",
+          "reference/processors",
+          "reference/losses",
+          "reference/metrics",
+          "reference/onnx"
+        ]
+      },
+      {
+        "group": "Project",
+        "pages": [
+          "contributing"
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Model zoo",
+        "href": "/models"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Try the demo",
+      "href": "https://huggingface.co/spaces/feyninc/feynobg"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/feyninc/nobg",
+      "website": "https://huggingface.co/feyninc"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude"
+    ]
+  },
+  "redirects": {
+    "$ref": "./redirects.json"
+  }
+}

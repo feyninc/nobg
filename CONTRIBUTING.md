@@ -64,43 +64,41 @@ default exporter fails on it — record which error forced it, in a comment).
 
 ## Documentation
 
-The docs site is a [Fumadocs](https://fumadocs.dev) app in [`docs/`](docs), deployed on Vercel.
+The docs site is a [Mintlify](https://mintlify.com) site in [`docs/`](docs).
 
 ```bash
 cd docs
-npm install
-npm run dev     # http://localhost:3000
+npx mint dev     # http://localhost:3000
 ```
 
-| Path                      | What it holds                                                  |
-| ------------------------- | -------------------------------------------------------------- |
-| `docs/content/docs/`      | Every page, as MDX. The file path is the URL                    |
-| `docs/content/docs/*/meta.json` | Sidebar order and section titles                         |
-| `docs/lib/shared.ts`      | Site name, repo coordinates, external links                     |
-| `docs/lib/layout.shared.tsx` | Nav title, logo, top-level nav links                         |
-| `docs/app/(home)/page.tsx`| Landing page                                                    |
+| Path                 | What it holds                                                   |
+| -------------------- | --------------------------------------------------------------- |
+| `docs/docs.json`     | Site name, colors, sidebar navigation, navbar and footer links  |
+| `docs/*.mdx`         | Get-started pages. The file path is the URL                     |
+| `docs/guides/`       | Guides                                                          |
+| `docs/reference/`    | API reference                                                   |
+| `docs/images/`       | Static images                                                   |
 
-Front matter is `title`, `description` and an optional `icon` (any [lucide](https://lucide.dev/icons)
-export name). `Card`, `Cards` and `Callout` need no import; `Tabs`, `Steps`, `TypeTable` and
-`Accordions` are registered in `docs/components/mdx.tsx` — add new components there rather than
-importing them per page.
+Front matter is `title`, `description` and an optional `icon` (any [Lucide](https://lucide.dev/icons)
+name, kebab-case). A page appears in the sidebar only once it is listed under `navigation` in
+`docs/docs.json`. Mintlify components (`Note`, `Warning`, `CardGroup`, `Tabs`, `Steps`,
+`ResponseField`, ...) need no import; see `docs/README.md` for the conventions in use.
 
 Before opening a docs PR:
 
 ```bash
 cd docs
-npm run build          # also type-checks
+npx mint validate
+npx mint broken-links --check-anchors
 ```
 
-If you change the public API, update the matching page under `docs/content/docs/reference/`. Every page
-has an "Edit on GitHub" link that points at its source file, so the fastest fix is often from the site
-itself.
+If you change the public API, update the matching page under `docs/reference/`.
 
 ### Deployment
 
-Vercel builds from this repo with **Root Directory** set to `docs`; the framework, build command and
-output directory are all detected. `main` deploys to production and every other branch gets a preview
-URL. Nothing in the Python package is part of that build.
+The Mintlify GitHub app deploys from this repo with the docs path set to `/docs`. `main` deploys
+to production and pull requests get preview builds. Nothing in the Python package is part of that
+build.
 
 ## Pull requests
 

@@ -1,71 +1,74 @@
 # nobg docs
 
 The documentation site for [nobg](https://github.com/feyninc/nobg), built with
-[Fumadocs](https://fumadocs.dev) on Next.js.
+[Mintlify](https://mintlify.com).
 
 ## Develop
 
 ```bash
-npm install
-npm run dev
+cd docs
+npx mint dev            # http://localhost:3000
 ```
 
-Then open http://localhost:3000.
+Before opening a docs PR:
 
-| Script                 | What it does                            |
-| ---------------------- | --------------------------------------- |
-| `npm run dev`          | Dev server with hot reload              |
-| `npm run build`        | Production build                        |
-| `npm run start`        | Serve the production build              |
-| `npm run types:check`  | `next typegen` + `tsc --noEmit`         |
+```bash
+npx mint validate                    # docs.json schema + every page parses
+npx mint broken-links --check-anchors
+```
 
 ## Writing content
 
-Pages are MDX files under `content/docs/`. The URL follows the file path, so
-`content/docs/guides/onnx.mdx` becomes `/docs/guides/onnx`.
+Pages are MDX files in this directory. The URL follows the file path, so `guides/onnx.mdx`
+becomes `/guides/onnx`; internal links use that path (`[ONNX export](/guides/onnx)`).
 
 ```mdx
 ---
 title: Page title
-description: One line, used for search results and OG images.
-icon: Package
+description: One line, used for search results and social cards.
+icon: package
 ---
 ```
 
-`icon` is any [lucide](https://lucide.dev/icons) export name, resolved by `lucideIconsPlugin` in
-`lib/source.ts`.
+`icon` is any [Lucide](https://lucide.dev/icons) icon name in kebab-case (`docs.json` sets
+`icons.library` to `lucide`).
 
-Navigation order comes from the `meta.json` beside the pages — a page not listed there still renders,
-it just falls to the end of the sidebar:
+A page only appears in the sidebar once it is listed under `navigation` in `docs.json`, which
+also sets the group titles and order.
 
-```json
-{
-  "title": "Guides",
-  "pages": ["background-removal", "text-prompts", "---Section---", "onnx"]
-}
-```
+Every [Mintlify component](https://mintlify.com/docs/components) is available without an
+import. The ones these pages use:
 
-`Card`, `Cards`, `Callout` and the code-block components are available in every page without importing.
-`Tabs`, `Tab`, `Steps`, `Step`, `TypeTable`, `Accordion` and `Accordions` are registered in
-`components/mdx.tsx` — add anything else there rather than importing it per page.
+| Component                       | Used for                                   |
+| ------------------------------- | ------------------------------------------ |
+| `<Note>` / `<Warning>`          | Asides; put a short title in bold first    |
+| `<CardGroup>` + `<Card>`        | Link grids                                 |
+| `<Tabs>` + `<Tab title="...">`  | uv / pip alternatives                      |
+| `<Steps>` + `<Step title="...">`| Ordered procedures                         |
+| `<ResponseField>`               | Config fields and arguments: `name`, `type`, `required`; write the default in the body as "Defaults to \`x\`." |
+| `<Frame>` / `<Columns>`         | Images                                     |
+
+Headings whose Mintlify id differs from the old Fumadocs one are pinned with `## Heading {#old-id}`
+so existing anchor links keep working; keep the pin if you reword such a heading.
+
+Images live in `images/` and are referenced from the site root (`/images/dog_input.png`).
 
 ## Layout
 
-| Path                      | What it holds                                                    |
-| ------------------------- | ---------------------------------------------------------------- |
-| `content/docs/`           | Every documentation page, as MDX                                 |
-| `lib/shared.ts`           | Site name, description, repo coordinates, external links         |
-| `lib/layout.shared.tsx`   | Nav title, logo and top-level nav links                          |
-| `lib/source.ts`           | Content source adapter and page-URL helpers                      |
-| `app/(home)/page.tsx`     | Landing page                                                     |
-| `app/docs/`               | Docs layout and the catch-all page route                         |
-| `app/api/search/route.ts` | Search endpoint (Orama, built at request time from the content)   |
-| `app/og/`                 | Generated Open Graph images                                      |
+| Path         | What it holds                                              |
+| ------------ | ---------------------------------------------------------- |
+| `docs.json`  | Site name, colors, navigation, navbar and footer links     |
+| `redirects.json` | Old Fumadocs `/docs/...` URLs → their new paths        |
+| `*.mdx`      | Get-started pages                                          |
+| `guides/`    | Task-oriented guides                                       |
+| `reference/` | API reference                                              |
+| `images/`    | Static images                                              |
 
-`lib/shared.ts` is the one file to edit when the repo moves or a link changes: `gitConfig.contentDir`
-is what makes each page's "Edit on GitHub" link resolve, given the Next app is nested in `docs/`.
+Search, `llms.txt` / `llms-full.txt`, a `.md` version of every page and social images are
+generated by Mintlify; there is nothing to maintain for them here.
 
-## Deploying to Vercel
+## Deploying
 
-Import the `nobg` repo and set **Root Directory** to `docs`. Everything else is detected. Pushing to
-`main` deploys; every other branch gets a preview.
+The Mintlify GitHub app deploys from this repo with the docs path set to `/docs` (a monorepo
+setup in the Mintlify dashboard). Pushing to `main` deploys; pull requests get preview builds.
+Nothing in the Python package is part of that build.

@@ -1,0 +1,4 @@
+[
+  { "source": "/docs", "destination": "/" },
+  { "source": "/docs/:slug*", "destination": "/:slug*" }
+]

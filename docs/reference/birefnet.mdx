@@ -1,0 +1,169 @@
+---
+title: BiRefNet
+description: The bilateral reference matting model — config, forward, and its methods.
+---
+
+```python
+from nobg import BiRefNet
+from nobg.birefnet.modeling_birefnet import BiRefNetConfig
+```
+
+Bilateral Reference Network for high-resolution dichotomous image segmentation
+([arXiv:2401.03407](https://arxiv.org/abs/2401.03407)), with a Swin backbone from `transformers`.
+`feyninc/FeyNobg` is the published checkpoint.
+
+## `BiRefNetConfig`
+
+A plain dataclass; every field has a default, so `BiRefNet()` is valid (randomly initialized). It is
+serialized verbatim to `config.json`.
+
+<ResponseField name="image_size" type="int">
+  Square input resolution the model is built for. Defaults to `1024`.
+</ResponseField>
+
+<ResponseField name="patch_size" type="int">
+  Swin patch size. Defaults to `4`.
+</ResponseField>
+
+<ResponseField name="embed_dim" type="int">
+  Swin embedding width. Stage channels are embed_dim · 2^i. Defaults to `192`.
+</ResponseField>
+
+<ResponseField name="num_layers" type="int">
+  Number of backbone stages. Must match len(depths) and len(num_heads). Defaults to `4`.
+</ResponseField>
+
+<ResponseField name="depths" type="list[int]">
+  Blocks per stage. Defaults to `[2, 2, 18, 2]`.
+</ResponseField>
+
+<ResponseField name="num_heads" type="list[int]">
+  Attention heads per stage. Defaults to `[6, 12, 24, 48]`.
+</ResponseField>
+
+<ResponseField name="window_size" type="int">
+  Swin attention window. Defaults to `12`.
+</ResponseField>
+
+<ResponseField name="mlp_ratio" type="float">
+  Swin MLP expansion ratio. Defaults to `4.0`.
+</ResponseField>
+
+<ResponseField name="drop_path_rate" type="float">
+  Stochastic depth rate. Defaults to `0.2`.
+</ResponseField>
+
+<ResponseField name="dec_channels_inter" type="int">
+  Intermediate width inside each decoder block. Defaults to `64`.
+</ResponseField>
+
+<ResponseField name="use_multi_scale_input" type="bool">
+  Also run the backbone on a half-resolution copy and concatenate the features, doubling the channels the decoder sees. Defaults to `True`.
+</ResponseField>
+
+<ResponseField name="use_gradient_attention" type="bool">
+  Enable the decoder's gradient-attention path. Defaults to `True`.
+</ResponseField>
+
+<ResponseField name="use_image_patch_injection" type="bool">
+  Inject image patches into the decoder at each scale. Defaults to `True`.
+</ResponseField>
+
+<ResponseField name="nobg_version" type="str">
+  Version of nobg that built the config; recorded for provenance. Defaults to the installed nobg version.
+</ResponseField>
+
+`__post_init__` raises if `depths` or `num_heads` disagree with `num_layers`.
+
+```python
+model = BiRefNet(BiRefNetConfig(image_size=512, embed_dim=128))
+```
+
+## `forward`
+
+```python
+forward(pixel_values: Tensor, labels: Tensor | None = None) -> dict
+```
+
+<ResponseField name="pixel_values" type="Tensor" required>
+  (B, 3, H, W) preprocessed images.
+</ResponseField>
+
+<ResponseField name="labels" type="Tensor | None">
+  (B, 1, H, W) binary masks. When given, loss is added to the output. Defaults to `None`.
+</ResponseField>
+
+Returns:
+
+| Key | Shape | Notes |
+| :--- | :--- | :--- |
+| `logits` | `(B, 1, H, W)` | Raw alpha-matte logits — the final decoder scale, **not** sigmoided |
+| `intermediate_logits` | list of `(B, 1, h, w)` | The earlier decoder scales, used by the multi-scale loss |
+| `loss` | scalar | Only when `labels` was passed; computed by `model.criterion` |
+
+Unlike SAM3, `forward` accepts no prompt and no boxes.
+
+## `predict`
+
+```python
+predict(processor, image, *, batch_size=1, return_type="cutout", **processor_kwargs)
+```
+
+The full preprocess → forward → post-process → composite pipeline, under `no_grad` in eval mode on the
+model's own device and dtype. A single image returns a single result; a list returns a list, each at its
+original resolution.
+
+`processor` must be a `BiRefNetImageProcessor`. BiRefNet's signature stops at `image` — passing a third
+positional argument is a `TypeError`.
+
+See [Removing a background](/guides/background-removal) for the full argument table.
+
+## `process`
+
+```python
+process(image, *, batch_size=1, return_type="cutout", **processor_kwargs)
+```
+
+`predict` with the processor `default_processor()` describes. Everything else is forwarded unchanged.
+
+## `default_processor`
+
+```python
+default_processor() -> BiRefNetImageProcessor
+```
+
+Builds `BiRefNetImageProcessor(size={"height": config.image_size, "width": config.image_size})`.
+BiRefNet's preprocessing is fully determined by the config, so this needs nothing from the Hub — it
+mirrors `AutoProcessor`'s fallback for repos without a `preprocessor_config.json`.
+
+## `from_origin`
+
+```python
+@classmethod
+from_origin(origin, config=None, *, token=None, **overrides) -> BiRefNet
+```
+
+Builds a possibly re-parameterized model from an existing one, injecting every weight whose (remapped)
+key and shape still match. Understands both the current key layout and the pre-0.2.0 custom-Swin
+layout. See [Hub round-trips](/guides/hub#re-parameterizing-a-checkpoint).
+
+## `criterion`
+
+```python
+model.criterion = my_loss   # (scaled_preds: list[Tensor], gt: Tensor) -> Tensor
+```
+
+Defaults to `nobg.loss.birefnet_loss`. It is a plain function attribute, not a submodule, so it never
+enters the state dict and can be replaced outright. See [Losses](/reference/losses).
+
+## Inherited
+
+From `Revised_Mixin` (`PyTorchModelHubMixin` + `Onnx_Mixin`):
+
+- `save_pretrained`, `from_pretrained`, `push_to_hub` — the last auto-prefixes a bare `repo_id` with
+  your Hub username and injects the generated model card
+- `onnx_save_pretrained`, `onnx_push_to_hub`, `onnx_from_pretrained`, `onnx_dummy_inputs` — see
+  [ONNX](/reference/onnx)
+
+`onnx_dynamo` is `True` for BiRefNet: the `torch.export` path is required, because torchvision no
+longer registers an ONNX symbolic for `deform_conv2d`.
