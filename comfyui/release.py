@@ -26,6 +26,10 @@ PUBLIC_API = f"https://api.comfy.org/nodes/{NODE}/versions"
 ALLOWED_ARCHIVE = {
     "__init__.py",
     "pyproject.toml",
+    # ComfyUI-Manager installs dependencies only from requirements.txt; it
+    # ignores [project] dependencies, so without this the nobg library is
+    # never installed and the entrypoint fails with ModuleNotFoundError.
+    "requirements.txt",
     "README.md",
     "LICENSE",
     ".comfyignore",
@@ -51,6 +55,10 @@ def metadata(directory: Path) -> dict:
     assert len(minimum) == 1
     assert re.fullmatch(r"\d+\.\d+\.\d+", minimum[0])
     assert tuple(map(int, minimum[0].split("."))) >= (0, 3, 2)
+    requirements = (directory / "requirements.txt").read_text().split()
+    assert requirements == data["project"]["dependencies"], (
+        "requirements.txt must match [project] dependencies"
+    )
     return data["project"]
 
 

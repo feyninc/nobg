@@ -1,6 +1,6 @@
 [project]
 name = "nobg"
-version = "0.1.1"
+version = "0.1.2"
 description = "NoBG background removal and foreground refinement nodes for ComfyUI"
 readme = "README.md"
 license = { file = "LICENSE" }
