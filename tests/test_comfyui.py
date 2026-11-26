@@ -59,7 +59,10 @@ def test_registry_metadata_and_release_notes(tmp_path):
     assert comfy["DisplayName"] == "NoBG"
     assert (PACK / "LICENSE").read_bytes() == (ROOT / "LICENSE").read_bytes()
     assert (PACK / ".comfyignore").exists()
-    for name in ("pyproject.toml", "CHANGELOG.md"):
+    # ComfyUI-Manager reads only requirements.txt, never [project] dependencies.
+    requirements = (PACK / "requirements.txt").read_text().split()
+    assert requirements == project["dependencies"]
+    for name in ("pyproject.toml", "requirements.txt", "CHANGELOG.md"):
         (tmp_path / name).write_bytes((PACK / name).read_bytes())
     (tmp_path / "CHANGELOG.md").write_text(f"## {version}\n \n")
     with pytest.raises(ValueError, match="nonempty"):

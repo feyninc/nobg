@@ -1,5 +1,12 @@
 # Registry release notes
 
+## 0.1.2
+
+Fix installation through ComfyUI-Manager and `comfy node install nobg`: the
+pack now ships a `requirements.txt` declaring `nobg>=0.3.2`, so the `nobg`
+library is installed alongside the node. 0.1.1 installed the node without the
+library and failed to load with `No module named 'nobg'`. No node changes.
+
 ## 0.1.1
 
 Add the NoBG logo as the Registry node icon. No node changes.
